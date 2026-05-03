@@ -26,7 +26,6 @@ from rich.text import Text
 
 from panels.base import fit_bar_width, FILLED, EMPTY
 from theme import LABEL, SECONDARY, MEDIUM, DIM, BRIGHT, heat_temp, heat_temp_empty
-from panels import lhm
 
 # Module-level aliases — keep call sites short. Color decisions are owned
 # by theme.py; we just bind shorter names locally.
