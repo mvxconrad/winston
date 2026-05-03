@@ -42,20 +42,53 @@
 - [x] Filter BIOS trip-points and firmware placeholders (NZXT 85°C bug)
 - [x] Persistent network peak tracking from CSV log
 
-## Stage 5: AI Commentary (current focus)
-- [ ] Install Ollama on Windows host
-- [ ] Firewall rule for port 11434 (mirror LHM rule)
-- [ ] Pull qwen2.5:7b
-- [ ] Verify connectivity from WSL: `curl http://<host>:11434/api/tags`
-- [ ] Wire COMMENTARY panel to call Ollama every 30-60s
-- [ ] Build observation summary prompt (recent stats → text context)
-- [ ] Anomaly detection ("Chrome usually uses 2GB, now using 8GB")
-- [ ] Predictions ("at this download rate, ARK update done in 23 min")
+## Stage 5: AI Commentary ✅
+- [x] Install Ollama on Windows host
+- [x] Firewall rule for port 11434 (mirror LHM rule)
+- [x] Pull qwen2.5:7b-instruct
+- [x] Verify connectivity from WSL: `curl http://<host>:11434/api/tags`
+- [x] Python client with sync/async/streaming APIs (`brain/client.py`)
+- [x] Observation summary prompt builder (`brain/prompt.py`)
+- [x] CSV log scanner for retrospectives (`brain/history.py`)
+- [x] Wire COMMENTARY panel to call Ollama every 30s
+- [x] Streaming token display with blinking cursor
+- [x] Time-of-day-aware greeting on startup ("Good morning, max")
+- [x] 24-hour retrospective on startup
+- [x] Multi-line chat-log style history with timestamps
+- [x] Configurable typewriter speed (decouple LLM gen rate from UI display rate)
+
+## Stage 5.5: Smart Triggers + Priority Tiers (next)
+The current 30s polling is dumb — it talks regardless of whether anything
+is happening. Replace with a trigger system that fires when something is
+actually noteworthy. Tiered priority handles race conditions cleanly.
+
+- [ ] `brain/triggers.py` — runs at 1Hz, scores current state vs recent baseline
+- [ ] Rolling baselines per metric (CPU avg, GPU temp, RAM, network, etc.)
+- [ ] Trigger conditions:
+  - [ ] CPU avg jumped >2x baseline
+  - [ ] GPU temp crossed thresholds (70°C, 80°C, 85°C)
+  - [ ] New process appeared in top 5
+  - [ ] Network rate jumped >5x baseline
+  - [ ] Stale check: if nothing's fired in N minutes, force a routine update
+- [ ] Priority tiers:
+  - [ ] `routine`  — slow typewriter (~5 tps), can be interrupted
+  - [ ] `notable`  — medium typewriter (~15 tps), preempts routine
+  - [ ] `alert`    — instant display, always preempts
+- [ ] Race-condition handling:
+  - [ ] Lower-tier message in flight gets interrupted by higher-tier
+  - [ ] Resume interrupted message after high-priority finishes? (decide later)
+- [ ] User prompt input is treated as `alert` tier (immediate response)
+
+## Stage 5.6: Conversational Mode
+- [ ] Text input below COMMENTARY panel (toggleable with hotkey)
+- [ ] Route user query through LLM with current state as context
+- [ ] Multi-turn: model can ask follow-up questions
+- [ ] Eventually: tools the model can call (read_log, get_process_details, etc.)
 
 ## Stage 6: Local LLM tuning
 - [ ] Compare 7B vs 3B model speed/quality tradeoff
 - [ ] Optimize prompts for smaller models
-- [ ] Streaming output to commentary panel (token-by-token)
+- [ ] Try qwen2.5:3b for routine, llama3.1:8b for alerts (small fast / big smart)
 
 ## Stage 7: Long-term Tracking
 - [ ] Migrate from CSV to SQLite when log gets unwieldy

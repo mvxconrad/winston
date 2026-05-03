@@ -51,20 +51,304 @@ class FooterBar(Static):
 
 
 class CommentaryPanel(Static):
-    """Placeholder commentary. Will be wired to LLM next."""
-    def on_mount(self):
-        self.set_interval(3.0, self.cycle)
-        self._tick = 0
-        self.cycle()
+    """LLM-powered commentary panel — chat-log style with typewriter.
 
-    def cycle(self):
-        self._tick += 1
-        lines = [
-            "[bold bright_green]>[/bold bright_green] [bright_green]system status[/bright_green] [grey50]::[/grey50] [bright_green]NOMINAL[/bright_green]",
-            "[bold bright_green]>[/bold bright_green] [bright_green]analysis subsystem[/bright_green] [grey50]::[/grey50] [#1a8c1a]offline[/#1a8c1a] [grey50](pending llm setup)[/grey50]",
-            "[bold bright_green]>[/bold bright_green] [bright_green]observation log[/bright_green] [grey50]::[/grey50] [bright_green]ACTIVE[/bright_green] [grey50]→ logs/raw/[/grey50]",
-        ]
-        self.update(lines[self._tick % len(lines)])
+    Shows a scrolling history of messages; older messages stay visible
+    above the newest, fading in brightness. Uses a typewriter buffer to
+    decouple LLM generation speed from display speed: tokens arrive fast,
+    panel emits them at config['typewriter_tps'] for a more deliberate feel.
+
+    On startup (if config['startup_greeting']):
+      1. Greeting: "Good morning, max."
+      2. Retrospective: brief comment on last 24h of logs
+      3. Begin regular commentary loop
+
+    Threading: LLM worker runs on its own thread (brain.client) and fires
+    callbacks from THAT thread. We use Textual's call_from_thread() to
+    bounce state mutations to the UI thread.
+    """
+
+    # Cursor blink rate while streaming
+    CURSOR_BLINK_HZ = 2.5
+
+    def __init__(self, sections=None, config=None, **kwargs):
+        super().__init__(**kwargs)
+        self._sections = sections or []
+        self._config = config or {"enabled": False}
+
+        # Chat-log history: list of (timestamp_str, message) tuples.
+        # Capped at config['lines'] - 1 (one slot reserved for currently-
+        # streaming message). Older messages slide off the top.
+        self._history = []
+        self._max_history = max(1, self._config.get("lines", 5)) - 1
+
+        # Typewriter machinery. The LLM stream writes into _streaming_buffer
+        # as fast as tokens arrive. The typewriter timer advances
+        # _typed_chars at config['typewriter_tps'] rate. We display the
+        # buffer truncated to _typed_chars.
+        self._streaming_buffer = ""   # what the LLM has produced so far
+        self._typed_chars = 0          # how much the typewriter has revealed
+        self._stream_complete = False  # LLM has signalled done
+
+        # Possible states: THINKING, STREAMING, IDLE, ERROR, DISABLED
+        if self._config.get("enabled", False):
+            self._state = "THINKING"
+        else:
+            self._state = "DISABLED"
+
+        self._cursor_visible = True
+        # Whether the current message is part of startup ritual
+        # ("greeting", "retrospective", or None for regular commentary)
+        self._startup_step = None
+        # Set when we're in the inter-message pause (current done, next not yet started)
+        self._cooldown_active = False
+
+    # ──────────────── Lifecycle ────────────────
+    def on_mount(self):
+        if not self._config.get("enabled", False):
+            self._paint()
+            return
+
+        # Cursor blink
+        self.set_interval(1.0 / self.CURSOR_BLINK_HZ, self._toggle_cursor)
+        # Typewriter — emits chars at the configured rate
+        tps = self._config.get("typewriter_tps", 25)
+        self.set_interval(1.0 / tps, self._typewriter_tick)
+
+        # Begin startup sequence (if enabled), else jump to regular loop
+        if self._config.get("startup_greeting", True):
+            self._startup_step = "greeting"
+            self._trigger_greeting()
+        else:
+            self._begin_regular_loop()
+        self._paint()
+
+    # ──────────────── Startup sequence ────────────────
+    def _trigger_greeting(self):
+        from brain.client import generate_stream_async
+        from brain.prompt import build_greeting_prompt
+
+        try:
+            system, user = build_greeting_prompt(
+                user_name=self._config.get("user_name")
+            )
+        except Exception:
+            self._on_startup_step_done()
+            return
+
+        self._begin_streaming()
+        generate_stream_async(
+            user, system=system, model=self._config.get("model"),
+            on_chunk=self._on_chunk_worker,
+            on_done=self._on_startup_done_worker,
+            on_error=self._on_startup_error_worker,
+        )
+
+    def _trigger_retrospective(self):
+        from brain.prompt import build_retrospective_prompt
+        from brain.history import summarize_recent
+
+        try:
+            stats = summarize_recent(hours=24)
+            system, user = build_retrospective_prompt(stats)
+        except Exception:
+            self._on_startup_step_done()
+            return
+
+        if system is None or user is None:
+            self._on_startup_step_done()
+            return
+
+        # Wait the inter-message pause before starting next message
+        pause = self._config.get("inter_message_pause_sec", 2.0)
+        self.set_timer(pause, lambda: self._begin_retrospective_call(system, user))
+
+    def _begin_retrospective_call(self, system, user):
+        from brain.client import generate_stream_async
+        self._begin_streaming()
+        generate_stream_async(
+            user, system=system, model=self._config.get("model"),
+            on_chunk=self._on_chunk_worker,
+            on_done=self._on_startup_done_worker,
+            on_error=self._on_startup_error_worker,
+        )
+
+    def _on_startup_step_done(self):
+        if self._startup_step == "greeting":
+            self._startup_step = "retrospective"
+            self._trigger_retrospective()
+        elif self._startup_step == "retrospective":
+            self._startup_step = None
+            pause = self._config.get("inter_message_pause_sec", 2.0)
+            self.set_timer(pause, self._begin_regular_loop)
+
+    def _begin_regular_loop(self):
+        interval = self._config.get("interval_sec", 30.0)
+        self.set_interval(interval, self._trigger_llm)
+        self._trigger_llm()
+
+    # ──────────────── Regular LLM trigger ────────────────
+    def _trigger_llm(self):
+        # Don't queue another call while one is in flight or being typed out
+        if self._state in ("STREAMING", "THINKING") or self._cooldown_active:
+            return
+
+        from brain.client import generate_stream_async
+        from brain.prompt import build_observation_prompt
+
+        try:
+            system, user = build_observation_prompt(self._sections)
+        except Exception:
+            self._state = "ERROR"
+            self._paint()
+            return
+
+        self._begin_streaming()
+        generate_stream_async(
+            user, system=system, model=self._config.get("model"),
+            on_chunk=self._on_chunk_worker,
+            on_done=self._on_done_worker,
+            on_error=self._on_error_worker,
+        )
+
+    # ──────────────── Streaming + typewriter ────────────────
+    def _begin_streaming(self):
+        """Reset state for a fresh LLM call."""
+        self._streaming_buffer = ""
+        self._typed_chars = 0
+        self._stream_complete = False
+        self._state = "THINKING"
+        self._paint()
+
+    def _typewriter_tick(self):
+        """Advance the typewriter cursor by one character if there's more to show."""
+        if self._typed_chars < len(self._streaming_buffer):
+            self._typed_chars += 1
+            self._paint()
+        elif self._stream_complete and self._state != "IDLE":
+            # All tokens received AND all chars shown — message is fully done
+            self._finalize_message()
+
+    def _finalize_message(self):
+        """Move the just-finished streaming message into history."""
+        msg = self._streaming_buffer.strip()
+        if msg:
+            from datetime import datetime
+            ts = datetime.now().strftime("%H:%M:%S")
+            self._history.append((ts, msg))
+            # Trim history to max
+            if len(self._history) > self._max_history:
+                self._history = self._history[-self._max_history:]
+
+        self._streaming_buffer = ""
+        self._typed_chars = 0
+        self._stream_complete = False
+        self._state = "IDLE"
+        self._cooldown_active = True
+        self._paint()
+
+        # Cooldown: after the inter-message pause, allow next message to start
+        pause = self._config.get("inter_message_pause_sec", 2.0)
+        self.set_timer(pause, self._end_cooldown)
+
+    def _end_cooldown(self):
+        self._cooldown_active = False
+        # If this was a startup step, advance to the next one now
+        if self._startup_step is not None:
+            self._on_startup_step_done()
+
+    # ──────────────── Worker-thread callbacks ────────────────
+    # Fire from the LLM worker thread; we marshal back to UI thread.
+    def _on_chunk_worker(self, chunk):
+        self.app.call_from_thread(self._on_chunk, chunk)
+
+    def _on_done_worker(self, _full_text):
+        self.app.call_from_thread(self._on_done)
+
+    def _on_error_worker(self):
+        self.app.call_from_thread(self._on_error)
+
+    def _on_startup_done_worker(self, _full_text):
+        self.app.call_from_thread(self._on_done)
+
+    def _on_startup_error_worker(self):
+        self.app.call_from_thread(self._on_startup_error)
+
+    # ──────────────── UI-thread state updates ────────────────
+    def _on_chunk(self, chunk):
+        if self._state == "THINKING":
+            self._state = "STREAMING"
+        self._streaming_buffer += chunk
+        # Don't update _typed_chars here — let the typewriter tick advance it
+        self._paint()
+
+    def _on_done(self):
+        # LLM is done generating, but typewriter may still be catching up.
+        # Mark stream complete; _typewriter_tick will call _finalize_message
+        # once it's caught up to the buffer length.
+        self._stream_complete = True
+
+    def _on_error(self):
+        self._state = "ERROR"
+        self._paint()
+        # Still treat as a finished step so startup can advance
+        if self._startup_step is not None:
+            self._cooldown_active = True
+            pause = self._config.get("inter_message_pause_sec", 2.0)
+            self.set_timer(pause, self._end_cooldown)
+
+    def _on_startup_error(self):
+        self._on_error()
+
+    # ──────────────── Rendering ────────────────
+    def _toggle_cursor(self):
+        if self._state in ("STREAMING", "THINKING"):
+            self._cursor_visible = not self._cursor_visible
+            self._paint()
+
+    def _paint(self):
+        """Render the history + currently-streaming message."""
+        if self._state == "DISABLED":
+            self.update("[bold bright_green]>[/bold bright_green] "
+                        "[grey50]analysis subsystem :: disabled[/grey50] "
+                        "[grey50](LLM_ENABLED = False in winston.py)[/grey50]")
+            return
+
+        # Build line list: [old, old, old, current_streaming]
+        lines = []
+
+        # Older history lines, dimmed
+        for ts, msg in self._history:
+            safe = msg.replace("[", r"\[")
+            lines.append(f"[grey50]{ts}[/grey50]  "
+                         f"[bold grey50]>[/bold grey50] "
+                         f"[#1a8c1a]{safe}[/#1a8c1a]")
+
+        # Current line — depends on state
+        if self._state == "THINKING":
+            cursor = "█" if self._cursor_visible else " "
+            lines.append(f"[grey50]--:--:--[/grey50]  "
+                         f"[bold bright_green]>[/bold bright_green] "
+                         f"[grey50]thinking…[/grey50] "
+                         f"[bright_green]{cursor}[/bright_green]")
+        elif self._state == "STREAMING":
+            from datetime import datetime
+            ts = datetime.now().strftime("%H:%M:%S")
+            visible = self._streaming_buffer[:self._typed_chars]
+            safe = visible.replace("[", r"\[")
+            cursor = "█" if self._cursor_visible else " "
+            lines.append(f"[grey50]{ts}[/grey50]  "
+                         f"[bold bright_green]>[/bold bright_green] "
+                         f"[bright_green]{safe}[/bright_green]"
+                         f"[bright_green]{cursor}[/bright_green]")
+        elif self._state == "ERROR":
+            lines.append(f"[grey50]--:--:--[/grey50]  "
+                         f"[bold bright_green]>[/bold bright_green] "
+                         f"[red]analysis error[/red] "
+                         f"[grey50](LLM unreachable)[/grey50]")
+        # IDLE state — no current line, just history
+
+        self.update("\n".join(lines))
 
 
 # ──────────────── Panel widgets ────────────────
@@ -293,9 +577,9 @@ class WinstonApp(App):
         padding: 0 1;
     }
 
-    /* Commentary — bigger, holds future LLM output */
+    /* Commentary — taller, holds the LLM chat-log (height set dynamically) */
     #commentary_panel {
-        height: 6;
+        height: 9;
         border: round green;
         border-title-color: ansi_bright_green;
         border-title-style: bold;
@@ -308,7 +592,7 @@ class WinstonApp(App):
         ("r", "reset_history", "Reset"),
     ]
 
-    def __init__(self, sections, logger, logger_hz=1.0):
+    def __init__(self, sections, logger, logger_hz=1.0, llm_config=None):
         super().__init__()
         # sections is a list of (panel_instance, refresh_hz) tuples
         # We split into parallel lists for convenience
@@ -316,6 +600,9 @@ class WinstonApp(App):
         self.section_rates = [s[1] for s in sections]
         self.logger = logger
         self.logger_hz = logger_hz
+        # LLM config dict — passed through to CommentaryPanel.
+        # See run() for the keys.
+        self.llm_config = llm_config or {"enabled": False}
 
         (self.cpu_graph,
          self.cpu,
@@ -382,7 +669,12 @@ class WinstonApp(App):
             self._panel_widgets.setdefault(id(self.processes), []).append(procs)
             yield procs
 
-        commentary = CommentaryPanel(id="commentary_panel")
+        commentary = CommentaryPanel(sections=self.sections,
+                                      config=self.llm_config,
+                                      id="commentary_panel")
+        # Panel height = line count + borders (2) + padding (0) + a little
+        # buffer (1). With config['lines'] of 5 -> 8 cells.
+        commentary.styles.height = self.llm_config.get("lines", 5) + 3
         commentary.border_title = "─ COMMENTARY ─"
         yield commentary
 
@@ -444,7 +736,10 @@ class WinstonApp(App):
         self.logger.close()
 
 
-def run(sections, logger, logger_hz=1.0):
+def run(sections, logger, logger_hz=1.0,
+        llm_enabled=True, llm_model="qwen2.5:7b-instruct", user_name=None,
+        commentary_interval_sec=30.0, startup_greeting=True,
+        typewriter_tps=25, inter_message_pause_sec=2.0, commentary_lines=5):
     """Prime panels with one update each (so the screen renders with data
     immediately) THEN start the Textual app. Slow panels like DiskPanel
     finish their initial scan during this priming phase, before the user
@@ -470,5 +765,15 @@ def run(sections, logger, logger_hz=1.0):
 
     print("ready.")
 
-    app = WinstonApp(sections, logger, logger_hz=logger_hz)
+    llm_config = {
+        "enabled": llm_enabled,
+        "model": llm_model,
+        "user_name": user_name,
+        "interval_sec": commentary_interval_sec,
+        "startup_greeting": startup_greeting,
+        "typewriter_tps": typewriter_tps,
+        "inter_message_pause_sec": inter_message_pause_sec,
+        "lines": commentary_lines,
+    }
+    app = WinstonApp(sections, logger, logger_hz=logger_hz, llm_config=llm_config)
     app.run()
