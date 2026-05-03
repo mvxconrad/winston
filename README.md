@@ -2,7 +2,15 @@
 
 **W**ell-trained **I**ntuitive **N**eural **S**ystem **T**ranslating **O**bserved **N**umbers
 
-A personal system monitor for the terminal. Watches CPU, RAM, GPU, disks, network, temperatures, and processes. Logs everything to CSV. Eventually, a local LLM reads what's happening and generates commentary.
+A personal system monitor for the terminal. Watches CPU, RAM, GPU, disks, network, temperatures, and processes. Logs everything to CSV. A local LLM (Ollama) reads what's happening and produces dry, observant commentary — both on a heartbeat and event-driven when something noteworthy happens.
+
+![Winston at idle](docs/screenshot-idle.png)
+
+*Idle state — Winston greeted at 04:43, summarized the day, and is sitting quietly. Conversational input below for asking questions.*
+
+![Winston reacting to a load spike](docs/screenshot-active.png)
+
+*Triggered state — `yes > /dev/null` running on four cores. The `single_core_pegged` trigger fired, Winston is mid-sentence calling it out specifically.*
 
 ## Stack
 
