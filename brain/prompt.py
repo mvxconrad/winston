@@ -46,7 +46,21 @@ def summarize_cpu(p):
         return None
     avg = p.average
     peak = max(max(h) for h in p.histories) if p.histories else avg
-    return f"CPU {avg:.0f}% (peak {peak:.0f}% over last min)"
+    # Mention hot cores explicitly — the average can hide a single-core peg.
+    # Catches cases like `yes > /dev/null` where avg is misleading.
+    hot_cores = [(i, v) for i, v in enumerate(p.values) if v >= 80]
+    if hot_cores:
+        # If the average is already high, just note overall load
+        if avg >= 50:
+            core_note = ""
+        elif len(hot_cores) == 1:
+            i, v = hot_cores[0]
+            core_note = f", core {i} at {v:.0f}%"
+        else:
+            core_note = f", {len(hot_cores)} cores >80%"
+    else:
+        core_note = ""
+    return f"CPU {avg:.0f}% (peak {peak:.0f}% over last min{core_note})"
 
 
 def summarize_ram(p):
@@ -166,41 +180,77 @@ def build_observation_prompt(sections):
     return SYSTEM_PROMPT, user_prompt
 
 
+# ──────────────── Triggered commentary prompt ────────────────
+# When a specific event fires, we want Winston to comment on THAT event
+# specifically — not just describe state generally. The trigger description
+# tells the model what to focus on.
+
+TRIGGERED_SYSTEM_PROMPT = """You are Winston, an AI watching this computer's \
+vital signs. Something just happened that's worth commenting on. Below \
+you'll see a TRIGGER (the specific thing that fired) and the current \
+system snapshot for context.
+
+Rules:
+- ONE OR TWO short sentences max.
+- Comment on the TRIGGER specifically. Don't restate every metric.
+- Be observant and a little dry, like in your usual commentary.
+- If the trigger description is enough info, you don't need to dig further.
+- No preamble like "Looking at the data..." — just the observation.
+"""
+
+
+def build_triggered_prompt(sections, trigger_event):
+    """Build a prompt focused on a specific trigger event.
+
+    sections: panel list (for current state context)
+    trigger_event: a brain.triggers.TriggerEvent
+
+    Returns (system, user).
+    """
+    # Get the standard snapshot for context
+    _system, snapshot = build_observation_prompt(sections)
+
+    user = (f"TRIGGER ({trigger_event.severity}): {trigger_event.description}\n"
+            f"\n"
+            f"Current state:\n"
+            f"{snapshot}\n"
+            f"\n"
+            f"Comment on this.")
+    return TRIGGERED_SYSTEM_PROMPT, user
+
+
 # ──────────────── Greeting prompt ────────────────
 GREETING_SYSTEM_PROMPT = """You are Winston, an AI butler watching over a \
 personal computer. The user has just launched you. Greet them warmly but \
-briefly, like a butler in the morning.
+briefly, like a butler.
 
 Rules:
 - ONE short sentence only.
 - If the user has a name, address them by it.
-- Match the time of day in your greeting (morning / afternoon / evening / night).
-- Don't be effusive. A simple "Good morning, Max." is perfect.
+- Match the time of day. Specifically:
+  * 5am-12pm:  "Good morning"
+  * 12pm-5pm:  "Good afternoon"
+  * 5pm-10pm:  "Good evening"
+  * 10pm-2am:  Still "Good evening" — never "good night" (that's a farewell)
+  * 2am-5am:   Acknowledge the late hour. Examples: "Up late tonight, max?",
+               "Late-night session, max — I'm here.", "Welcome to the small hours."
+- Don't be effusive. A simple greeting is perfect.
 - No preamble, no metadata. Just the greeting.
 """
 
 
-def build_greeting_prompt(user_name=None, time_of_day=None):
+def build_greeting_prompt(user_name=None, hour=None):
     """Build the greeting prompt. Returns (system, user).
 
-    time_of_day: "morning" / "afternoon" / "evening" / "night"
-                 If None, computed from the current time.
+    hour: 0-23 hour of day. If None, computed from current time.
     """
-    if time_of_day is None:
+    if hour is None:
         from datetime import datetime
-        h = datetime.now().hour
-        if 5 <= h < 12:
-            time_of_day = "morning"
-        elif 12 <= h < 17:
-            time_of_day = "afternoon"
-        elif 17 <= h < 22:
-            time_of_day = "evening"
-        else:
-            time_of_day = "night"
+        hour = datetime.now().hour
 
-    name_clause = f"The user's name is {user_name}." if user_name else "The user has not given a name."
-    user = (f"It is currently {time_of_day}. {name_clause} "
-            f"Greet them.")
+    name_clause = (f"The user's name is {user_name}." if user_name
+                   else "The user has not given a name.")
+    user = f"It is currently {hour:02d}:00 (24-hour time). {name_clause} Greet them."
     return GREETING_SYSTEM_PROMPT, user
 
 
@@ -247,6 +297,53 @@ def build_retrospective_prompt(stats):
 
     user = "\n".join(parts)
     return RETROSPECTIVE_SYSTEM_PROMPT, user
+
+
+# ──────────────── Conversational prompt ────────────────
+CONVERSATIONAL_SYSTEM_PROMPT = """You are Winston, an AI butler watching \
+over a personal computer. The user has asked you a direct question. They \
+can see the dashboard — CPU, RAM, GPU, temperatures, network, processes. \
+Use the current observation snapshot below to answer them.
+
+Rules:
+- Be concise. 1-3 short sentences max.
+- Be direct and a little dry, but helpful.
+- Use the data you see — quote specific numbers where relevant.
+- If you genuinely don't know or can't tell from the data, say so.
+- No preamble like "Looking at your system..." — just answer.
+- If the user asked a follow-up, treat the prior turns as context.
+"""
+
+
+def build_conversational_prompt(sections, user_question, history=None):
+    """Build the prompt for a user-initiated question.
+
+    sections: panel list (for current state context)
+    user_question: the user's typed question
+    history: optional list of (user_msg, assistant_msg) pairs from prior turns
+
+    Returns (system, user) where user includes the snapshot + history + question.
+    """
+    # Get current observation snapshot, same as periodic commentary
+    _system, snapshot = build_observation_prompt(sections)
+
+    parts = [
+        "Current system snapshot:",
+        snapshot,
+        "",
+    ]
+
+    # Include prior turns if any (capped — last 3 to keep prompt bounded)
+    if history:
+        for prev_q, prev_a in history[-3:]:
+            parts.append(f"User asked: {prev_q}")
+            parts.append(f"You answered: {prev_a}")
+            parts.append("")
+
+    parts.append(f"User asks: {user_question}")
+    parts.append("Answer:")
+
+    return CONVERSATIONAL_SYSTEM_PROMPT, "\n".join(parts)
 
 
 # ──────────────── Self-test ────────────────

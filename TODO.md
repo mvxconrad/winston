@@ -57,33 +57,66 @@
 - [x] Multi-line chat-log style history with timestamps
 - [x] Configurable typewriter speed (decouple LLM gen rate from UI display rate)
 
-## Stage 5.5: Smart Triggers + Priority Tiers (next)
-The current 30s polling is dumb — it talks regardless of whether anything
-is happening. Replace with a trigger system that fires when something is
-actually noteworthy. Tiered priority handles race conditions cleanly.
+## Stage 5.5: Smart Triggers ✅ (mostly)
+Polling replaced with event-driven triggers + heartbeat. `brain/triggers.py`
+ticks at 1Hz, evaluates triggers against rolling baselines, fires
+commentary when something actually happened.
 
-- [ ] `brain/triggers.py` — runs at 1Hz, scores current state vs recent baseline
-- [ ] Rolling baselines per metric (CPU avg, GPU temp, RAM, network, etc.)
-- [ ] Trigger conditions:
-  - [ ] CPU avg jumped >2x baseline
-  - [ ] GPU temp crossed thresholds (70°C, 80°C, 85°C)
-  - [ ] New process appeared in top 5
-  - [ ] Network rate jumped >5x baseline
-  - [ ] Stale check: if nothing's fired in N minutes, force a routine update
-- [ ] Priority tiers:
-  - [ ] `routine`  — slow typewriter (~5 tps), can be interrupted
-  - [ ] `notable`  — medium typewriter (~15 tps), preempts routine
-  - [ ] `alert`    — instant display, always preempts
-- [ ] Race-condition handling:
-  - [ ] Lower-tier message in flight gets interrupted by higher-tier
-  - [ ] Resume interrupted message after high-priority finishes? (decide later)
-- [ ] User prompt input is treated as `alert` tier (immediate response)
+- [x] `brain/triggers.py` — 1Hz tick, evaluates registered triggers
+- [x] `brain/baselines.py` — rolling mean/stddev per metric (5-min window)
+- [x] All trigger thresholds + cooldowns config-driven (`config.TRIGGERS`)
+- [x] Starter triggers shipped:
+  - [x] `single_core_pegged` (catches `yes > /dev/null` etc.)
+  - [x] `cpu_sustained_high` (avg above threshold for N seconds)
+  - [x] `cpu_thermal` (notable + alert temp bands)
+  - [x] `gpu_thermal` (notable + alert temp bands)
+  - [x] `memory_pressure` (RAM near full or swap usage)
+  - [x] `network_burst` (anomaly vs rolling baseline)
+  - [x] `new_heavy_process` (top-1 changed and is significant)
+- [x] Heartbeat cadence (config: `HEARTBEAT_INTERVAL_SEC`, default 5min)
+- [x] Stale-quiet defense (force a routine if NOTHING fires for 15min)
+- [x] Per-trigger cooldowns prevent the same observation firing 50x
+- [x] Triggered prompt — LLM gets the trigger description + state, comments on event specifically
+- [x] Per-core CPU details in routine prompt (catches single-core peg even without trigger)
+- [x] Color fade for chat history (newest bright → oldest grey)
 
-## Stage 5.6: Conversational Mode
-- [ ] Text input below COMMENTARY panel (toggleable with hotkey)
-- [ ] Route user query through LLM with current state as context
-- [ ] Multi-turn: model can ask follow-up questions
-- [ ] Eventually: tools the model can call (read_log, get_process_details, etc.)
+## Stage 5.5b: Priority tier preemption (deferred)
+Currently `alert`-tier triggers preempt the in-flight stream, but
+`notable`-tier doesn't (we don't know what the current message's tier is).
+Stage 5.5b makes preemption fully tier-aware.
+
+- [ ] Track current message's tier on `CommentaryPanel`
+- [ ] `notable` preempts `routine` mid-stream
+- [ ] `alert` preempts anything mid-stream (already partly working)
+- [ ] Per-tier typewriter speeds: routine slow, notable medium, alert instant
+- [ ] Decide: resume interrupted message after high-priority finishes? (probably no)
+
+## Stage 5.6: Conversational Mode (partial — input shipped, tools pending)
+- [x] Text input below COMMENTARY panel (`/` to focus, vim-style)
+- [x] Route user query through LLM with current state as context
+- [x] Multi-turn: keeps last 3 Q&A pairs as context for follow-ups
+- [x] User questions preempt routine commentary
+- [ ] Tools the model can call (Tier 1: read-only)
+  - [ ] `read_log(minutes)` — pull recent CSV rows
+  - [ ] `get_process_details(pid)` — full info on a specific process
+  - [ ] `query_baseline(metric, window)` — "what's normal for this?"
+- [ ] Tools (Tier 2: user-confirmed actions)
+- [ ] Tools (Tier 3: sudo allow-list, very long-term)
+
+## Stage 5.7: Refactor pass (cleanup before more features)
+Before adding more stuff, split the files that have grown >500 lines.
+Refactor along natural seams, not just for line count.
+
+- [ ] `display.py` (~750 lines) — split:
+  - [ ] Move `CommentaryPanel` → `brain/commentary.py` (LLM stuff lives with LLM stuff)
+  - [ ] Move `CpuGraphWidget` → `panels/cpu_graph_widget.py` (next to its data class)
+  - [ ] Keep `WinstonApp`, `PanelWidget`, `StatusBar`, `FooterBar` in `display.py`
+- [ ] `panels/temps.py` (~500 lines) — split:
+  - [ ] Move backend functions (`_try_native`, `_try_lhm_http`, `_try_powershell_wmi`)
+        and the `smart_label` helper to `panels/temps_backends.py`
+  - [ ] `panels/temps.py` keeps just the `TempsPanel` class
+- [ ] `panels/network.py` (~450 lines) — leave for now, it's one cohesive job
+- [ ] `panels/gpu.py` (~360 lines) — leave for now, well-organized internally
 
 ## Stage 6: Local LLM tuning
 - [ ] Compare 7B vs 3B model speed/quality tradeoff

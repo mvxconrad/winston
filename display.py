@@ -6,7 +6,7 @@ from datetime import datetime
 import psutil
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
-from textual.widgets import Static
+from textual.widgets import Static, Input
 
 
 # ──────────────── Custom chrome ────────────────
@@ -76,19 +76,24 @@ class CommentaryPanel(Static):
         self._sections = sections or []
         self._config = config or {"enabled": False}
 
-        # Chat-log history: list of (timestamp_str, message) tuples.
-        # Capped at config['lines'] - 1 (one slot reserved for currently-
-        # streaming message). Older messages slide off the top.
+        # Chat-log history: list of (timestamp_str, message, kind) tuples.
+        # kind is "winston" (LLM output) or "user" (user question).
+        # Capped at config['lines'] - 1 (one slot reserved for streaming).
         self._history = []
         self._max_history = max(1, self._config.get("lines", 5)) - 1
 
-        # Typewriter machinery. The LLM stream writes into _streaming_buffer
-        # as fast as tokens arrive. The typewriter timer advances
-        # _typed_chars at config['typewriter_tps'] rate. We display the
-        # buffer truncated to _typed_chars.
-        self._streaming_buffer = ""   # what the LLM has produced so far
-        self._typed_chars = 0          # how much the typewriter has revealed
-        self._stream_complete = False  # LLM has signalled done
+        # Q&A history for multi-turn context (separate from display history).
+        # List of (user_question, winston_answer) pairs. Last 3 fed back to
+        # the LLM as context so follow-ups make sense.
+        self._qa_history = []
+        # The user question that's currently being answered (so when the
+        # answer streams in, we know to record the pair into _qa_history)
+        self._pending_user_question = None
+
+        # Typewriter machinery — same as before
+        self._streaming_buffer = ""
+        self._typed_chars = 0
+        self._stream_complete = False
 
         # Possible states: THINKING, STREAMING, IDLE, ERROR, DISABLED
         if self._config.get("enabled", False):
@@ -97,10 +102,7 @@ class CommentaryPanel(Static):
             self._state = "DISABLED"
 
         self._cursor_visible = True
-        # Whether the current message is part of startup ritual
-        # ("greeting", "retrospective", or None for regular commentary)
         self._startup_step = None
-        # Set when we're in the inter-message pause (current done, next not yet started)
         self._cooldown_active = False
 
     # ──────────────── Lifecycle ────────────────
@@ -183,16 +185,98 @@ class CommentaryPanel(Static):
             self.set_timer(pause, self._begin_regular_loop)
 
     def _begin_regular_loop(self):
-        interval = self._config.get("interval_sec", 30.0)
-        self.set_interval(interval, self._trigger_llm)
-        self._trigger_llm()
+        """Start the trigger-driven commentary loop.
 
-    # ──────────────── Regular LLM trigger ────────────────
-    def _trigger_llm(self):
-        # Don't queue another call while one is in flight or being typed out
-        if self._state in ("STREAMING", "THINKING") or self._cooldown_active:
+        Two timers:
+          1. 1Hz trigger tick — pushes baselines, evaluates triggers, fires
+             commentary if a trigger says so.
+          2. Heartbeat — every config['heartbeat_interval_sec'] seconds,
+             fires a routine commentary regardless. Reassures the user
+             Winston is alive even when nothing's happening.
+        """
+        from brain.triggers import TriggerRunner
+        self._trigger_runner = TriggerRunner(self._config.get("triggers", {}))
+        # Time of last commentary firing (any kind — trigger, heartbeat, user)
+        # Used by the stale-quiet check.
+        import time
+        self._last_fire_time = time.monotonic()
+        # When the last heartbeat fired (separate from _last_fire_time
+        # because user input/triggers don't reset the heartbeat clock —
+        # we still want one ~5min after launch even if you've been busy).
+        self._last_heartbeat_time = time.monotonic()
+
+        # 1Hz tick: evaluate triggers
+        self.set_interval(1.0, self._tick_triggers)
+
+        # Fire one routine commentary right away so the panel has fresh
+        # content as soon as startup ritual is done
+        self._trigger_routine("startup commentary")
+
+    # ──────────────── Trigger-driven loop ────────────────
+    def _tick_triggers(self):
+        """Called every second. Updates baselines, checks for events,
+        fires commentary if appropriate."""
+        import time
+        now = time.monotonic()
+
+        # Always update baselines, even if we're streaming. Baselines should
+        # reflect actual ongoing state, not only when we're idle.
+        try:
+            event = self._trigger_runner.tick(self._sections)
+        except Exception:
+            event = None
+
+        # If we're currently streaming, the only thing that should preempt
+        # is an `alert`-tier event. Notable preempts routine but we don't
+        # know if the current stream is routine or notable here, so we
+        # play it conservative: only alerts preempt. (Stage 5.5 may revisit.)
+        is_busy = self._state in ("STREAMING", "THINKING") or self._cooldown_active
+
+        if event is not None:
+            if is_busy and event.severity != "alert":
+                return  # let current message finish; this trigger's cooldown
+                        # already started so it won't fire again immediately
+            self._trigger_event(event)
+            self._last_fire_time = now
             return
 
+        # No event fired. Check if it's time for a heartbeat.
+        if is_busy:
+            return
+
+        heartbeat_interval = self._config.get("heartbeat_interval_sec", 300)
+        if heartbeat_interval > 0 and (now - self._last_heartbeat_time) >= heartbeat_interval:
+            self._last_heartbeat_time = now
+            self._last_fire_time = now
+            self._trigger_routine("heartbeat")
+            return
+
+        # Stale check — nothing's happened in a long time at all
+        stale = self._config.get("stale_quiet_threshold_sec", 900)
+        if stale > 0 and (now - self._last_fire_time) >= stale:
+            self._last_fire_time = now
+            self._trigger_routine("stale quiet")
+
+    def _trigger_event(self, event):
+        """Fire commentary for a specific trigger event."""
+        from brain.client import generate_stream_async
+        from brain.prompt import build_triggered_prompt
+
+        try:
+            system, user = build_triggered_prompt(self._sections, event)
+        except Exception:
+            return
+
+        self._begin_streaming()
+        generate_stream_async(
+            user, system=system, model=self._config.get("model"),
+            on_chunk=self._on_chunk_worker,
+            on_done=self._on_done_worker,
+            on_error=self._on_error_worker,
+        )
+
+    def _trigger_routine(self, _reason):
+        """Fire a routine commentary (heartbeat / stale / startup)."""
         from brain.client import generate_stream_async
         from brain.prompt import build_observation_prompt
 
@@ -235,10 +319,18 @@ class CommentaryPanel(Static):
         if msg:
             from datetime import datetime
             ts = datetime.now().strftime("%H:%M:%S")
-            self._history.append((ts, msg))
+            self._history.append((ts, msg, "winston"))
             # Trim history to max
             if len(self._history) > self._max_history:
                 self._history = self._history[-self._max_history:]
+
+            # If this answered a user question, record the pair for multi-turn
+            if self._pending_user_question is not None:
+                self._qa_history.append((self._pending_user_question, msg))
+                # Cap Q&A history at last 5 (we only feed back last 3 anyway)
+                if len(self._qa_history) > 5:
+                    self._qa_history = self._qa_history[-5:]
+                self._pending_user_question = None
 
         self._streaming_buffer = ""
         self._typed_chars = 0
@@ -256,6 +348,61 @@ class CommentaryPanel(Static):
         # If this was a startup step, advance to the next one now
         if self._startup_step is not None:
             self._on_startup_step_done()
+
+    # ──────────────── User question handler ────────────────
+    def ask_user(self, question):
+        """Handle a user question typed into the conversational input.
+
+        Preempts whatever is currently streaming (user's question is alert-
+        tier — they're waiting for an answer). Adds the question to the chat
+        log, then fires an LLM call with current state + Q&A history as
+        context.
+        """
+        if not self._config.get("enabled", False):
+            return
+        if not question or not question.strip():
+            return
+
+        from brain.client import generate_stream_async
+        from brain.prompt import build_conversational_prompt
+        from datetime import datetime
+
+        # If something's mid-stream, finalize it abruptly so the chat log
+        # doesn't lose the partial message. This is the simplest race-
+        # condition handling — Stage 5.5 will replace this with proper
+        # tier-based preemption.
+        if self._state == "STREAMING":
+            # Force-finalize what's been typed so far
+            self._typed_chars = len(self._streaming_buffer)
+            self._finalize_message()
+            self._cooldown_active = False  # don't make user wait through cooldown
+
+        # Add the user's question to the chat log
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._history.append((ts, question.strip(), "user"))
+        if len(self._history) > self._max_history:
+            self._history = self._history[-self._max_history:]
+
+        # Build prompt with snapshot + multi-turn context + the question
+        try:
+            system, user_prompt = build_conversational_prompt(
+                self._sections, question.strip(), history=self._qa_history
+            )
+        except Exception:
+            self._state = "ERROR"
+            self._paint()
+            return
+
+        # Track the pending question so we can pair it with the answer
+        self._pending_user_question = question.strip()
+
+        self._begin_streaming()
+        generate_stream_async(
+            user_prompt, system=system, model=self._config.get("model"),
+            on_chunk=self._on_chunk_worker,
+            on_done=self._on_done_worker,
+            on_error=self._on_error_worker,
+        )
 
     # ──────────────── Worker-thread callbacks ────────────────
     # Fire from the LLM worker thread; we marshal back to UI thread.
@@ -314,17 +461,42 @@ class CommentaryPanel(Static):
                         "[grey50](LLM_ENABLED = False in winston.py)[/grey50]")
             return
 
-        # Build line list: [old, old, old, current_streaming]
         lines = []
 
-        # Older history lines, dimmed
-        for ts, msg in self._history:
-            safe = msg.replace("[", r"\[")
-            lines.append(f"[grey50]{ts}[/grey50]  "
-                         f"[bold grey50]>[/bold grey50] "
-                         f"[#1a8c1a]{safe}[/#1a8c1a]")
+        # Color fade for older messages — newest gets bright green, each
+        # older line steps down through medium green, dim green, to grey.
+        # The fade tells the eye where "now" is at a glance.
+        FADE_PALETTE = ["bright_green", "#3aa83a", "#1a8c1a", "#0a5a0a", "grey50"]
 
-        # Current line — depends on state
+        history_count = len(self._history)
+        for idx, entry in enumerate(self._history):
+            # Tolerate old (ts, msg) format if it slipped in
+            if len(entry) == 3:
+                ts, msg, kind = entry
+            else:
+                ts, msg = entry
+                kind = "winston"
+            safe = msg.replace("[", r"\[")
+
+            # Distance from the end determines fade depth.
+            # The newest history entry (idx == count-1) gets the second-
+            # brightest color (because position 0 of the palette is reserved
+            # for the actively-streaming line).
+            distance_from_end = (history_count - 1) - idx
+            color = FADE_PALETTE[min(distance_from_end + 1, len(FADE_PALETTE) - 1)]
+
+            if kind == "user":
+                # User lines: keep the cyan accent, fade the body to grey
+                # at the same rate as winston lines.
+                lines.append(f"[grey50]{ts}[/grey50]  "
+                             f"[bold bright_cyan]?[/bold bright_cyan] "
+                             f"[#3a8a9c]{safe}[/#3a8a9c]")
+            else:
+                lines.append(f"[grey50]{ts}[/grey50]  "
+                             f"[bold {color}]>[/bold {color}] "
+                             f"[{color}]{safe}[/{color}]")
+
+        # Current streaming line — always rendered in the brightest green
         if self._state == "THINKING":
             cursor = "█" if self._cursor_visible else " "
             lines.append(f"[grey50]--:--:--[/grey50]  "
@@ -346,7 +518,6 @@ class CommentaryPanel(Static):
                          f"[bold bright_green]>[/bold bright_green] "
                          f"[red]analysis error[/red] "
                          f"[grey50](LLM unreachable)[/grey50]")
-        # IDLE state — no current line, just history
 
         self.update("\n".join(lines))
 
@@ -585,11 +756,26 @@ class WinstonApp(App):
         border-title-style: bold;
         padding: 0 1;
     }
+
+    /* Conversational input — single-line text input below commentary */
+    #user_input {
+        height: 3;
+        border: round green;
+        border-title-color: ansi_bright_cyan;
+        border-title-style: bold;
+        padding: 0 1;
+        background: black;
+        color: ansi_bright_cyan;
+    }
+    #user_input:focus {
+        border: round ansi_bright_cyan;
+    }
     """
 
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("r", "reset_history", "Reset"),
+        ("slash", "focus_input", "Ask"),
     ]
 
     def __init__(self, sections, logger, logger_hz=1.0, llm_config=None):
@@ -678,6 +864,15 @@ class WinstonApp(App):
         commentary.border_title = "─ COMMENTARY ─"
         yield commentary
 
+        # Conversational input — only shown if LLM is enabled. Press / to focus.
+        if self.llm_config.get("enabled", False):
+            user_input = Input(
+                placeholder="ask Winston something… (press / to focus)",
+                id="user_input",
+            )
+            user_input.border_title = "─ ASK ─"
+            yield user_input
+
         yield FooterBar(id="footer_bar")
 
     def on_mount(self) -> None:
@@ -732,19 +927,50 @@ class WinstonApp(App):
                 for h in s.histories:
                     h.clear()
 
+    def action_focus_input(self) -> None:
+        """Focus the conversational input. Bound to '/' key (vim-style)."""
+        try:
+            self.query_one("#user_input", Input).focus()
+        except Exception:
+            # Input not present (LLM disabled). Silently ignore.
+            pass
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """User pressed Enter in the input box. Hand the question to the
+        commentary panel and clear the input."""
+        if event.input.id != "user_input":
+            return
+        question = event.value.strip()
+        event.input.value = ""  # clear for next question
+        if not question:
+            return
+        try:
+            commentary = self.query_one("#commentary_panel", CommentaryPanel)
+            commentary.ask_user(question)
+        except Exception:
+            pass
+        # Return focus to the main app so / works again without clicking out
+        event.input.blur()
+
     def on_unmount(self) -> None:
         self.logger.close()
 
 
-def run(sections, logger, logger_hz=1.0,
-        llm_enabled=True, llm_model="qwen2.5:7b-instruct", user_name=None,
-        commentary_interval_sec=30.0, startup_greeting=True,
-        typewriter_tps=25, inter_message_pause_sec=2.0, commentary_lines=5):
+def run(sections, logger, config=None):
     """Prime panels with one update each (so the screen renders with data
     immediately) THEN start the Textual app. Slow panels like DiskPanel
     finish their initial scan during this priming phase, before the user
     sees the UI — eliminates the "panel is blank for 5 seconds" startup.
+
+    `config` is the config module (typically `import config`); it owns all
+    the tunable behavior. See config.py for what's available.
     """
+    if config is None:
+        # Fallback for someone calling run() programmatically without a
+        # config module — load the default one.
+        import config as default_config
+        config = default_config
+
     print("WINSTON :: priming sensors...", end=" ", flush=True)
 
     # Prime psutil
@@ -765,15 +991,22 @@ def run(sections, logger, logger_hz=1.0,
 
     print("ready.")
 
+    # Build the LLM config dict the panel expects, sourced from config.py.
+    # We keep the panel's interface as a dict (decoupled from the config
+    # module shape) so panel code stays testable in isolation.
     llm_config = {
-        "enabled": llm_enabled,
-        "model": llm_model,
-        "user_name": user_name,
-        "interval_sec": commentary_interval_sec,
-        "startup_greeting": startup_greeting,
-        "typewriter_tps": typewriter_tps,
-        "inter_message_pause_sec": inter_message_pause_sec,
-        "lines": commentary_lines,
+        "enabled":                 config.LLM_ENABLED,
+        "model":                   config.LLM_MODEL,
+        "user_name":               config.USER_NAME,
+        "startup_greeting":        config.STARTUP_GREETING,
+        "typewriter_tps":          config.TYPEWRITER_TPS,
+        "inter_message_pause_sec": config.INTER_MESSAGE_PAUSE_SEC,
+        "lines":                   config.COMMENTARY_LINES,
+        "heartbeat_interval_sec":  config.HEARTBEAT_INTERVAL_SEC,
+        "stale_quiet_threshold_sec": config.STALE_QUIET_THRESHOLD_SEC,
+        "triggers":                config.TRIGGERS,
     }
-    app = WinstonApp(sections, logger, logger_hz=logger_hz, llm_config=llm_config)
+    app = WinstonApp(sections, logger,
+                     logger_hz=config.LOGGER_HZ,
+                     llm_config=llm_config)
     app.run()
