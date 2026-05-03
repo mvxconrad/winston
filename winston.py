@@ -1,10 +1,115 @@
 import psutil
+from enum import Enum
+from collections import deque
 from rich.live import Live
 from rich.panel import Panel
+from rich.text import Text
 
+
+class HealthLevel(Enum):
+    OK = "green"
+    WARNING = "yellow"
+    CRITICAL = "red"
+
+def health_for(percent):
+    """Map a usage percentage to a health level"""
+    if percent <50:
+        return HealthLevel.OK
+    elif percent < 80:
+        return HealthLevel.WARNING
+    else:
+        return HealthLevel.CRITICAL
+    
+
+class CpuPanel:
+    def __init__(self, label="CPU", history_size=60):
+        self.label = label
+        self.values = []
+        self.histories = []
+        self.history_size = history_size
+
+    def update(self):
+        self.values = psutil.cpu_percent(interval=1, percpu=True)
+        
+        # First time we find # of cores, to set up histories
+        if not self.histories:
+            self.histories = [deque(maxlen=self.history_size) for _ in self.values]
+
+        # Append each core's current value to its own history
+        for i, v in enumerate(self.values):
+            self.histories[i].append(v)
+    
+    @property
+    def average(self):
+        """Aggregate CPU % - derived from per-core values."""
+        return sum(self.values) / len(self.values) if self.values else 0.0
+    
+    @property
+    def avg_history(self):
+        """Average of all averages over time (rough running mean)"""
+        if not self.histories or not self.histories[0]:
+            return 0.0
+        # average each timestep across cores, then average them
+        per_step = [sum(step) / len(step) for step in zip(*self.histories)]
+        return sum(per_step) / len(per_step)
+
+    def render(self):
+        text = Text()
+
+        # Top line: aggregate
+        avg = self.average
+        running = self.avg_history
+        health = health_for(avg)
+        text.append(f"{self.label}: {avg:5.1f}%   (avg: {running:5.1f}%)\n", style=health.value)
+
+        # Per-core breakdown
+        for i, v in enumerate(self.values):
+            core_health = health_for(v)
+            line = f"   Core {i:2d}: {v:5.1f}%"
+            text.append(line, style=core_health.value)
+            if i < len(self.values) - 1:
+                text.append("\n")
+
+        return text
+    
+
+class RamPanel: 
+    def __init__(self, label="RAM", history_size=60):
+        self.label = label
+        self.value = 0.0
+        self.history = deque(maxlen=history_size)
+
+    def update(self):
+        mem = psutil.virtual_memory()
+        self.value = mem.percent
+        self.history.append(self.value)
+
+    def render(self):
+        health = health_for(self.value)
+        avg = sum(self.history) / len(self.history) if self.history else 0
+        text = f"{self.label}: {self.value:5.1f}%   (avg: {avg:5.1f}%)"
+        return Text(text, style=health.value)
+    
+# Build section list
+cpu = CpuPanel()
+ram = RamPanel()
+sections = [cpu, ram]
+
+
+# Helper to combine multiple Text objects with newlines in between
+def render_all(sections):
+    combined = Text()
+    for i, section in enumerate(sections):
+        if i > 0:
+            combined.append("\n")
+        combined.append(section.render())
+    return combined
+
+
+# Main loop
 with Live(refresh_per_second=1) as live:
     while True:
-        cpu = psutil.cpu_percent(interval=1)
-        mem = psutil.virtual_memory()
-        text = f"CPU: {cpu}%    RAM: {mem.percent}%"
-        live.update(Panel(text, title="WINSTON"))
+        for section in sections:
+            section.update()
+        live.update(Panel(render_all(sections), title="WINSTON"))
+
