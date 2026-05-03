@@ -1,169 +1,63 @@
-import psutil
-import csv
-from enum import Enum
-from collections import deque
-from datetime import datetime
-from pathlib import Path
-from rich.live import Live
-from rich.panel import Panel
-from rich.text import Text
+"""WINSTON entry point.
+
+Refresh rates (Hz) are tunable per panel below. The display layer schedules
+each panel on its own interval. The logger always ticks at LOGGER_HZ
+regardless — gives you regular time-series rows for later analysis.
+
+Rough guidance:
+  4 Hz  — snappy UI feel for fast-changing data (CPU)
+  2 Hz  — comfortable for moderately-changing data (RAM, network, GPU)
+  1 Hz  — slow-changing or expensive to compute (processes, temps)
+  0.5+  — rarely-changing structural data (load avg, system info)
+  0.1   — practically static data (disk usage)
+
+Going faster doesn't add real info for things like disk %; going slower
+than 1 Hz on UI things makes them feel laggy. Tweak to taste.
+"""
+from panels.cpu_graph import CpuGraphPanel
+from panels.cpu import CpuPanel
+from panels.ram import RamPanel
+from panels.system import SystemPanel
+from panels.disk import DiskPanel
+from panels.temps import TempsPanel
+from panels.gpu import GpuPanel
+from panels.network import NetworkPanel
+from panels.processes import ProcessesPanel
+from logger import Logger
+from display import run
 
 
+# ─────────────────── Refresh rates (Hz) ───────────────────
+CPU_GRAPH_HZ   = 4.0
+CPU_CORES_HZ   = 4.0
+RAM_HZ         = 2.0
+SYSTEM_HZ      = 0.5     # load avg, proc count — slow movers
+DISK_HZ        = 0.1     # every 10s — disk fills slowly
+TEMPS_HZ       = 1.0
+GPU_HZ         = 2.0
+NETWORK_HZ     = 2.0
+PROCESSES_HZ   = 1.0     # process scan is the most expensive op
 
-class HealthLevel(Enum):
-    OK = "green"
-    WARNING = "yellow"
-    CRITICAL = "red"
+LOGGER_HZ      = 1.0     # fixed-rate CSV writes (gives clean time-series)
 
-def health_for(percent):
-    """Map a usage percentage to a health level"""
-    if percent <50:
-        return HealthLevel.OK
-    elif percent < 80:
-        return HealthLevel.WARNING
-    else:
-        return HealthLevel.CRITICAL
-    
-
-class CpuPanel:
-    def __init__(self, label="CPU", history_size=60):
-        self.label = label
-        self.values = []
-        self.histories = []
-        self.history_size = history_size
-
-    def update(self):
-        self.values = psutil.cpu_percent(interval=1, percpu=True)
-        
-        # First time we find # of cores, to set up histories
-        if not self.histories:
-            self.histories = [deque(maxlen=self.history_size) for _ in self.values]
-
-        # Append each core's current value to its own history
-        for i, v in enumerate(self.values):
-            self.histories[i].append(v)
-    
-    @property
-    def average(self):
-        """Aggregate CPU % - derived from per-core values."""
-        return sum(self.values) / len(self.values) if self.values else 0.0
-    
-    @property
-    def avg_history(self):
-        """Average of all averages over time (rough running mean)"""
-        if not self.histories or not self.histories[0]:
-            return 0.0
-        # average each timestep across cores, then average them
-        per_step = [sum(step) / len(step) for step in zip(*self.histories)]
-        return sum(per_step) / len(per_step)
-
-    def render(self):
-        text = Text()
-
-        # Top line: aggregate
-        avg = self.average
-        running = self.avg_history
-        health = health_for(avg)
-        text.append(f"{self.label}: {avg:5.1f}%   (avg: {running:5.1f}%)\n", style=health.value)
-
-        # Per-core breakdown
-        for i, v in enumerate(self.values):
-            core_health = health_for(v)
-            line = f"   Core {i:2d}: {v:5.1f}%"
-            text.append(line, style=core_health.value)
-            if i < len(self.values) - 1:
-                text.append("\n")
-
-        return text
-    
-    # CSV helpers
-    def csv_headers(self):
-        headers = ["cpu_avg"]
-        for i in range(len(self.values)):
-            headers.append(f"core_{i}")
-        return headers
-    
-    def csv_columns(self):
-        cols = [self.average]
-        cols.extend(self.values)
-        return cols
-    
-
-class RamPanel: 
-    def __init__(self, label="RAM", history_size=60):
-        self.label = label
-        self.value = 0.0
-        self.history = deque(maxlen=history_size)
-
-    def update(self):
-        mem = psutil.virtual_memory()
-        self.value = mem.percent
-        self.history.append(self.value)
-
-    def render(self):
-        health = health_for(self.value)
-        avg = sum(self.history) / len(self.history) if self.history else 0
-        text = f"{self.label}: {self.value:5.1f}%   (avg: {avg:5.1f}%)"
-        return Text(text, style=health.value)
-    
-    # CSV helpers
-    def csv_headers(self):
-        return ["ram_pct"]
-    
-    def csv_columns(self):
-        return [self.value]
-    
-class Logger:
-    def __init__(self, path="winston_log.csv"):
-        self.path = Path(path)
-        self._wrote_header = self.path.exists() # if file already exists, assume header is written
-        self._file = open(self.path, "a", newline="")
-        self._writer = csv.writer(self._file)
-
-    def log(self, sections):
-        # Build a row: timestamp, then values from each section
-        row = [datetime.now().isoformat()]
-        for section in sections:
-            row.extend(section.csv_columns())
-
-        if not self._wrote_header:
-            header = ["timestamp"]
-            for section in sections:
-                header.extend(section.csv_headers())
-            self._writer.writerow(header)
-            self._wrote_header = True
-
-        self._writer.writerow(row)
-        self._file.flush() # make sure it hits disk
-
-    def close(self):
-        self._file.close()
-
-# Helper to combine multiple Text objects with newlines in between
-def render_all(sections):
-    combined = Text()
-    for i, section in enumerate(sections):
-        if i > 0:
-            combined.append("\n")
-        combined.append(section.render())
-    return combined
+# How often TempsPanel actually re-fetches from LHM HTTP / PowerShell.
+# Decoupled from TEMPS_HZ — the panel update is cheap, the fetch is expensive.
+LHM_FETCH_INTERVAL_SEC = 3
 
 
-# Build section list
-cpu = CpuPanel()
-ram = RamPanel()
+# ─────────────────── Section list ───────────────────
+# Each tuple: (panel_instance, refresh_hz)
+sections = [
+    (CpuGraphPanel(),                                CPU_GRAPH_HZ),
+    (CpuPanel(),                                     CPU_CORES_HZ),
+    (RamPanel(),                                     RAM_HZ),
+    (SystemPanel(),                                  SYSTEM_HZ),
+    (DiskPanel(),                                    DISK_HZ),
+    (TempsPanel(refresh_sec=LHM_FETCH_INTERVAL_SEC), TEMPS_HZ),
+    (GpuPanel(),                                     GPU_HZ),
+    (NetworkPanel(),                                 NETWORK_HZ),
+    (ProcessesPanel(),                               PROCESSES_HZ),
+]
+
 logger = Logger()
-sections = [cpu, ram]
-
-
-# Main loop
-with Live(refresh_per_second=1) as live:
-    try:
-        while True:
-            for section in sections:
-                section.update()
-            logger.log(sections)
-            live.update(Panel(render_all(sections), title="WINSTON\n Well-trained Intuitive Neural System Translating Observed Numbers"))
-    finally:
-        logger.close()
-
+run(sections, logger, logger_hz=LOGGER_HZ)

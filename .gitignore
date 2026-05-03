@@ -1,7 +1,7 @@
-cat > .gitignore << 'EOF'
 venv/
 __pycache__/
 *.pyc
 .env
 .vscode/
-EOFwinston_log.csv
+logs/
+winston_log.csv
