@@ -1,9 +1,13 @@
 import psutil
+import csv
 from enum import Enum
 from collections import deque
+from datetime import datetime
+from pathlib import Path
 from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
+
 
 
 class HealthLevel(Enum):
@@ -72,6 +76,18 @@ class CpuPanel:
 
         return text
     
+    # CSV helpers
+    def csv_headers(self):
+        headers = ["cpu_avg"]
+        for i in range(len(self.values)):
+            headers.append(f"core_{i}")
+        return headers
+    
+    def csv_columns(self):
+        cols = [self.average]
+        cols.extend(self.values)
+        return cols
+    
 
 class RamPanel: 
     def __init__(self, label="RAM", history_size=60):
@@ -90,11 +106,38 @@ class RamPanel:
         text = f"{self.label}: {self.value:5.1f}%   (avg: {avg:5.1f}%)"
         return Text(text, style=health.value)
     
-# Build section list
-cpu = CpuPanel()
-ram = RamPanel()
-sections = [cpu, ram]
+    # CSV helpers
+    def csv_headers(self):
+        return ["ram_pct"]
+    
+    def csv_columns(self):
+        return [self.value]
+    
+class Logger:
+    def __init__(self, path="winston_log.csv"):
+        self.path = Path(path)
+        self._wrote_header = self.path.exists() # if file already exists, assume header is written
+        self._file = open(self.path, "a", newline="")
+        self._writer = csv.writer(self._file)
 
+    def log(self, sections):
+        # Build a row: timestamp, then values from each section
+        row = [datetime.now().isoformat()]
+        for section in sections:
+            row.extend(section.csv_columns())
+
+        if not self._wrote_header:
+            header = ["timestamp"]
+            for section in sections:
+                header.extend(section.csv_headers())
+            self._writer.writerow(header)
+            self._wrote_header = True
+
+        self._writer.writerow(row)
+        self._file.flush() # make sure it hits disk
+
+    def close(self):
+        self._file.close()
 
 # Helper to combine multiple Text objects with newlines in between
 def render_all(sections):
@@ -106,10 +149,21 @@ def render_all(sections):
     return combined
 
 
+# Build section list
+cpu = CpuPanel()
+ram = RamPanel()
+logger = Logger()
+sections = [cpu, ram]
+
+
 # Main loop
 with Live(refresh_per_second=1) as live:
-    while True:
-        for section in sections:
-            section.update()
-        live.update(Panel(render_all(sections), title="WINSTON"))
+    try:
+        while True:
+            for section in sections:
+                section.update()
+            logger.log(sections)
+            live.update(Panel(render_all(sections), title="WINSTON\n Well-trained Intuitive Neural System Translating Observed Numbers"))
+    finally:
+        logger.close()
 
