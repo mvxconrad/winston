@@ -118,10 +118,60 @@ Refactor along natural seams, not just for line count.
 - [ ] `panels/network.py` (~450 lines) — leave for now, it's one cohesive job
 - [ ] `panels/gpu.py` (~360 lines) — leave for now, well-organized internally
 
-## Stage 6: Local LLM tuning
-- [ ] Compare 7B vs 3B model speed/quality tradeoff
-- [ ] Optimize prompts for smaller models
-- [ ] Try qwen2.5:3b for routine, llama3.1:8b for alerts (small fast / big smart)
+## Stage 5.8: v0.8 review cleanup (next up)
+Things noticed after shipping v0.8 — small but high-value polish before
+moving to Stage 6.
+
+### Memory schema cleanup
+Currently `logs/memory.json` stores the same per-app payload twice:
+once in `behavior[name]` (keyed by name) and once in `top_apps[]`
+(list of dicts). One canonical store, derived views at read time.
+
+- [ ] One source of truth: `apps` keyed by process name, each entry
+      holds `hours / avg_cpu / peak_cpu / avg_gpu_when_top`
+- [ ] `get_top_apps(n)` computes the ranking from `apps` at call time
+      (sort by hours desc, take first n) — no separate `top_apps[]`
+      to keep in sync
+- [ ] Migrate existing `memory.json` files in place (one-shot read of
+      old shape → write new shape) so nobody has to delete the file
+- [ ] `BrainPanel.render()` and `brain/prompt.py` updated to use the
+      new accessor
+
+### CPU spike during commentary streaming
+When Winston is streaming a reply, our own python3 process jumps from
+~6% to ~30% CPU. The typewriter repaints the entire commentary block
+on every chunk; combined with the markup-parse cost on each
+`self.update()`, that's a lot of work per token.
+
+- [ ] Throttle commentary repaints to the master frame rate (~30Hz)
+      instead of one paint per chunk. Buffer chunks, paint on next
+      frame.
+- [ ] Verify with `top` that python3 stays <15% during streaming
+
+### Activate model tiering by default
+The scaffolding shipped in v0.8 (`LLM_USE_TIERED`, `LLM_MODEL_FAST`,
+`LLM_MODEL_QUALITY`, `LLM_QUALITY_KEEP_ALIVE_SEC`) currently defaults
+to `False` so behavior is identical to v0.7. Flip it on and verify.
+
+- [ ] `LLM_USE_TIERED = True` as default in `config.py`
+- [ ] qwen2.5:3b-instruct for routine + heartbeat + triggered (notable)
+      → stays VRAM-resident, sub-second response
+- [ ] qwen2.5:7b-instruct for greeting + retrospective + alerts +
+      conversational → unloads after 5min idle so VRAM is free for
+      games. Re-load is ~5-10s on next quality call (acceptable).
+- [ ] BRAIN panel shows which model is actually loaded right now
+      (already does — verify it updates correctly across tier switches)
+
+### Tools Winston asked for
+He literally requested these when asked what would help him do his job
+better. Reasonable Tier 1 (read-only) ideas to add to Stage 5.6:
+
+- [ ] `track_app(name)` — pin an app for deeper monitoring (per-app CPU
+      time, runtime distribution, GPU correlation)
+- [ ] `recent_runs(name, hours)` — when did this app last run, for how
+      long, what state was the system in
+- [ ] Custom usage-pattern alerts — "warn me when Chrome's RAM exceeds
+      its 95th percentile"
 
 ## Stage 7: Long-term Tracking
 - [ ] Migrate from CSV to SQLite when log gets unwieldy
