@@ -165,6 +165,30 @@ Done in v0.8.1.
 - [ ] BRAIN panel shows which model is actually loaded right now
       (already does — verify it updates correctly across tier switches)
 
+### Windows-host process visibility (so Winston can see games)
+`panels/processes.py` uses `psutil.process_iter()` which on WSL only
+sees processes inside the WSL2 VM — that's our dev tools (python, node,
+claude) but **never** the games (Ark, Steam, Chrome) which run on the
+Windows host. Winston is blind to what we're actually doing.
+
+Same problem we already solved for `panels/network.py`. Same solution:
+poll a PowerShell command on a daemon thread, cache the result, render
+host-side processes alongside or instead of WSL ones.
+
+- [ ] `panels/processes.py` gains a Windows-host source on WSL,
+      analogous to `NetworkPanel.source = "windows"`. PowerShell
+      command: `Get-Process | Sort-Object CPU -Descending | Select-Object -First 10 Id,ProcessName,CPU,WorkingSet`
+- [ ] Background thread polls every 5 s (same constraint as
+      `panels/network.py` — process spawn over the WSL→Windows boundary
+      is heavy)
+- [ ] Panel title reflects source: `PROCESSES (host)` vs
+      `PROCESSES (wsl)`, matching how NetworkPanel's title works
+- [ ] CSV log column is the host-side top process when available so
+      `brain/memory.py:learn_from_log` learns from games too — the
+      whole "knows what max plays" feature is unlocked by this fix
+- [ ] Update `brain/memory.py` to call out games in the personality
+      block once they're being logged
+
 ### 3B accuracy / awareness pass
 The 3B will confabulate when given ambiguous state. Real example from a
 heartbeat that fired during `yes > /dev/null`:

@@ -131,13 +131,15 @@ class Memory:
 
     def __init__(self, path=DEFAULT_MEMORY_PATH):
         self.path = path
-        # Default empty shape. Anything missing will be filled lazily.
+        # Default empty shape, in the order we want them written to disk:
+        #   user → last_learned → machine → apps
+        # apps is a name-keyed dict, the single source of truth. Top-N
+        # ranking is computed at read time via get_top_apps().
         self.facts = {
             "user": {},          # name, preferences
-            "machine": {},       # host, os, cpu, gpu, ram_gb
-            "top_apps": [],      # ranked: [{name, hours, ...}, ...]
-            "behavior": {},      # name -> {avg_cpu, avg_gpu, ...}
             "last_learned": None,
+            "machine": {},       # host, os, cpu, gpu, ram_gb
+            "apps": {},          # {name_lower: {name, hours, avg_cpu, peak_cpu, avg_gpu_when_top}}
         }
         self._load()
 
@@ -147,26 +149,55 @@ class Memory:
         try:
             with open(self.path, "r") as f:
                 data = json.load(f)
-            # Merge into defaults rather than replace, so a future schema
-            # addition doesn't break old memory files.
-            for k, v in data.items():
-                self.facts[k] = v
         except (FileNotFoundError, json.JSONDecodeError, OSError):
-            # First run, corrupted file, or unreadable. Start fresh —
-            # better than crashing on startup.
-            pass
+            return
+
+        # ── Migrate old schema (pre-v0.9): had separate `top_apps` list
+        # and `behavior` dict storing the SAME per-app payload. Collapse
+        # to a single `apps` dict.
+        if "apps" not in data and ("top_apps" in data or "behavior" in data):
+            apps = {}
+            # Prefer behavior dict (already keyed by name) when present.
+            for key, entry in (data.get("behavior") or {}).items():
+                if isinstance(entry, dict) and entry.get("name"):
+                    apps[entry["name"].lower()] = entry
+            # Fall back to top_apps list for any names not in behavior.
+            for entry in (data.get("top_apps") or []):
+                if isinstance(entry, dict) and entry.get("name"):
+                    k = entry["name"].lower()
+                    apps.setdefault(k, entry)
+            data["apps"] = apps
+            data.pop("top_apps", None)
+            data.pop("behavior", None)
+
+        # Merge into defaults so a future schema addition doesn't break
+        # old memory files.
+        for k, v in data.items():
+            self.facts[k] = v
 
     def save(self):
-        """Atomic write: tempfile + rename. Crash-safe."""
+        """Atomic write: tempfile + rename. Crash-safe.
+
+        Writes fields in a deterministic, human-readable order
+        (user → last_learned → machine → apps) rather than alphabetic
+        sort, so the file reads top-down like a profile.
+        """
+        # Build an ordered dict containing only known top-level keys so
+        # legacy fields can't sneak back in after migration. Python dicts
+        # preserve insertion order.
+        ordered = {
+            "user":          self.facts.get("user", {}),
+            "last_learned":  self.facts.get("last_learned"),
+            "machine":       self.facts.get("machine", {}),
+            "apps":          self.facts.get("apps", {}),
+        }
         try:
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-            # Write to a sibling tempfile first, then atomic rename so we
-            # never leave a half-written JSON file on disk.
             dir_ = os.path.dirname(self.path) or "."
             with tempfile.NamedTemporaryFile(
                 "w", dir=dir_, delete=False, suffix=".tmp", encoding="utf-8"
             ) as tf:
-                json.dump(self.facts, tf, indent=2, sort_keys=True)
+                json.dump(ordered, tf, indent=2)  # no sort_keys — order matters
                 tmp_path = tf.name
             os.replace(tmp_path, self.path)
         except OSError:
@@ -311,14 +342,16 @@ class Memory:
         except (OSError, csv.Error):
             return result
 
-        # Build the ranked top_apps list. Rank by seen-seconds — that's the
-        # cleanest "you actually use this app" signal.
-        ranked = []
-        for key, sec in sorted(seen.items(), key=lambda kv: -kv[1]):
+        # Build the apps dict. Single source of truth — name-keyed,
+        # capped at 25 entries (the prompt will only ever show the top
+        # few). Ranking by hours is computed at read time in
+        # get_top_apps() so we don't store the same payload twice.
+        apps = {}
+        for key, sec in sorted(seen.items(), key=lambda kv: -kv[1])[:25]:
             if sec < 60:
                 # Less than a minute total in 7 days — not interesting.
                 continue
-            entry = {
+            apps[key] = {
                 "name": display_name[key],
                 "hours": round(sec / 3600.0, 2),
                 "avg_cpu": (round(cpu_sum[key] / cpu_count[key], 1)
@@ -327,18 +360,10 @@ class Memory:
                 "avg_gpu_when_top": (round(gpu_sum_when_top[key] / gpu_count_when_top[key], 1)
                                      if gpu_count_when_top[key] else None),
             }
-            ranked.append(entry)
 
-        # Cap the stored list. The prompt will only show the top few; no
-        # point storing 500 rare apps that'll never get referenced.
-        ranked = ranked[:25]
-
-        self.facts["top_apps"] = ranked
-        # Same data, dict-shaped for fast lookup by name in the prompt
-        # builder ("is this current top process one of max's known apps?").
-        self.facts["behavior"] = {e["name"].lower(): e for e in ranked}
+        self.facts["apps"] = apps
         self.facts["last_learned"] = datetime.now().isoformat(timespec="seconds")
-        result["ranked_apps"] = len(ranked)
+        result["ranked_apps"] = len(apps)
         return result
 
     # ──────────────── Convenience accessors for the prompt builder ────────
@@ -366,8 +391,14 @@ class Memory:
         return ", ".join(bits)
 
     def get_top_apps(self, n=5):
-        """Return the top N most-used apps for the prompt."""
-        return self.facts.get("top_apps", [])[:n]
+        """Return the top N most-used apps as a list, ranked by hours
+        descending. Computed at read time from the canonical `apps` dict
+        — no separate ranked list is stored."""
+        apps = self.facts.get("apps", {})
+        ranked = sorted(apps.values(),
+                        key=lambda a: float(a.get("hours") or 0),
+                        reverse=True)
+        return ranked[:n]
 
     def lookup_app(self, name):
         """Look up a process name in derived behavior. Returns None if
@@ -375,7 +406,7 @@ class Memory:
         running so it can say 'this is one of max's frequent apps'."""
         if not name:
             return None
-        return self.facts.get("behavior", {}).get(name.lower())
+        return self.facts.get("apps", {}).get(name.lower())
 
 
 # ──────────────── Self-test ────────────────

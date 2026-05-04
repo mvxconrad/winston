@@ -59,8 +59,112 @@ Typical frontend flow (pseudocode):
 chunk/done/error callbacks (after marshaling) into engine.on_chunk /
 on_done / on_error.
 """
+import json
+import os
 import time
 from datetime import datetime
+
+
+# ──────────────── Reasoning trace log ────────────────
+# Every prompt we send to the LLM and every response we get back is
+# appended here as JSONL — one line per event. Lets you see exactly what
+# Winston was thinking when he said something weird, without having to
+# instrument either frontend.
+#
+# Tail the file to watch live:  tail -f logs/reasoning.jsonl
+#
+# Persistent across sessions, with a visible banner written on each
+# launch so you can scan the file (or `grep "WINSTON SESSION"`) to find
+# session boundaries. Rotates to .old when it crosses 50 MB so the file
+# can't grow unbounded.
+#
+# Schema (kept loose; one event per line):
+#   {"t": "2026-05-04T...",  "kind": "session_start", "pid": 12345}
+#   {"t": "...", "kind": "prompt",   "trigger": "greeting",
+#    "tier": "fast",  "model": "qwen2.5:3b-instruct",
+#    "system": "...", "user": "..."}
+#   {"t": "...", "kind": "response", "trigger": "greeting",
+#    "text": "Good evening, max.", "elapsed_sec": 2.4}
+#   {"t": "...", "kind": "trigger_fired", "name": "single_core_pegged",
+#    "severity": "notable", "description": "..."}
+#   {"t": "...", "kind": "error", "trigger": "greeting", "elapsed_sec": 6.0}
+#
+# Banner lines (between session_start events) are non-JSON dividers — a
+# JSON-strict consumer can filter to lines starting with `{`.
+REASONING_LOG_PATH = "logs/reasoning.jsonl"
+REASONING_LOG_MAX_BYTES = 50 * 1024 * 1024   # 50 MB
+_SESSION_BANNER_WRITTEN = False
+
+
+def _maybe_rotate():
+    """If the log has grown beyond REASONING_LOG_MAX_BYTES, archive it
+    with today's date in the filename so old logs accumulate over time:
+
+        reasoning.jsonl                       (current, always this name)
+        reasoning-2026-04-12.jsonl            (archived 2026-04-12)
+        reasoning-2026-05-01.jsonl            (archived 2026-05-01)
+        reasoning-2026-05-04-2.jsonl          (second rotation same day)
+
+    Then a fresh reasoning.jsonl starts. Old archives stick around
+    forever; user can delete them manually when they want.
+    """
+    try:
+        if not (os.path.exists(REASONING_LOG_PATH)
+                and os.path.getsize(REASONING_LOG_PATH) > REASONING_LOG_MAX_BYTES):
+            return
+        date = datetime.now().strftime("%Y-%m-%d")
+        base_dir = os.path.dirname(REASONING_LOG_PATH) or "."
+        # First try `reasoning-2026-05-04.jsonl`; if that exists (we
+        # rotated earlier today), bump a counter until we find a free name.
+        for n in range(100):
+            suffix = f"-{date}.jsonl" if n == 0 else f"-{date}-{n+1}.jsonl"
+            candidate = os.path.join(base_dir, f"reasoning{suffix}")
+            if not os.path.exists(candidate):
+                os.replace(REASONING_LOG_PATH, candidate)
+                return
+    except OSError:
+        pass
+
+
+def _ensure_session_banner():
+    """Write the per-session header on first trace call of this process.
+    Idempotent — safe to call from every `_trace`."""
+    global _SESSION_BANNER_WRITTEN
+    if _SESSION_BANNER_WRITTEN:
+        return
+    _SESSION_BANNER_WRITTEN = True
+    _maybe_rotate()
+    now = datetime.now()
+    banner = "═" * 78
+    title = f"  WINSTON SESSION  {now.strftime('%Y-%m-%d %H:%M:%S')}  pid={os.getpid()}"
+    try:
+        os.makedirs(os.path.dirname(REASONING_LOG_PATH) or ".", exist_ok=True)
+        with open(REASONING_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write("\n")
+            f.write(banner + "\n")
+            f.write(title + "\n")
+            f.write(banner + "\n")
+            event = {
+                "t": now.isoformat(timespec="seconds"),
+                "kind": "session_start",
+                "pid": os.getpid(),
+            }
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _trace(event):
+    """Append one JSON event to the reasoning log. Best-effort — never
+    raises so a failed write can't break commentary."""
+    _ensure_session_banner()
+    try:
+        os.makedirs(os.path.dirname(REASONING_LOG_PATH) or ".", exist_ok=True)
+        event = {"t": datetime.now().isoformat(timespec="seconds"), **event}
+        with open(REASONING_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 class CommentaryEngine:
@@ -135,6 +239,7 @@ class CommentaryEngine:
         self.typed_chars = 0
         self.stream_complete = False
         self.state = "THINKING"
+        self._stream_started_at = time.monotonic()
 
     def on_chunk(self, chunk):
         """Frontend calls this on the UI thread for each chunk."""
@@ -149,6 +254,9 @@ class CommentaryEngine:
 
     def on_error(self):
         self.state = "ERROR"
+        elapsed = time.monotonic() - getattr(self, "_stream_started_at", time.monotonic())
+        _trace({"kind": "error", "trigger": getattr(self, "_current_path", None),
+                "elapsed_sec": round(elapsed, 2)})
 
     def typewriter_advance(self):
         """Frontend calls at typewriter_tps. Returns one of:
@@ -189,6 +297,11 @@ class CommentaryEngine:
                 if len(self.qa_history) > 5:
                     self.qa_history = self.qa_history[-5:]
                 self.pending_user_question = None
+            elapsed = time.monotonic() - getattr(self, "_stream_started_at", time.monotonic())
+            _trace({"kind": "response",
+                    "trigger": getattr(self, "_current_path", None),
+                    "elapsed_sec": round(elapsed, 2),
+                    "text": msg})
         self.streaming_buffer = ""
         self.typed_chars = 0
         self.stream_complete = False
@@ -274,6 +387,17 @@ class CommentaryEngine:
     # Each returns (system, user, tier) or (None, None, None) on failure.
     # Frontend calls one of these, then `pick_model(tier)` to get the
     # actual model + keep_alive, then fires `generate_stream_async`.
+    #
+    # Each builder also stamps `self._current_path` and traces the prompt
+    # to logs/reasoning.jsonl so we can audit later what Winston was
+    # working from when he said something weird.
+
+    def _trace_prompt(self, path, system, user, tier):
+        self._current_path = path
+        model, _ = self.pick_model(tier)
+        _trace({"kind": "prompt", "trigger": path, "tier": tier,
+                "model": model, "system": system, "user": user})
+
     def build_greeting(self):
         from brain.prompt import build_greeting_prompt
         try:
@@ -283,6 +407,7 @@ class CommentaryEngine:
             )
         except Exception:
             return None, None, None
+        self._trace_prompt("greeting", system, user, "fast")
         return system, user, "fast"
 
     def build_retrospective(self):
@@ -295,6 +420,7 @@ class CommentaryEngine:
             return None, None, None
         if system is None or user is None:
             return None, None, None
+        self._trace_prompt("retrospective", system, user, "fast")
         return system, user, "fast"
 
     def build_triggered(self, event):
@@ -307,8 +433,11 @@ class CommentaryEngine:
             return None, None, None
         self.last_event = (event.name, event.severity,
                            datetime.now().strftime("%H:%M:%S"))
+        _trace({"kind": "trigger_fired", "name": event.name,
+                "severity": event.severity, "description": event.description})
         # All triggered events use fast — popping the 7B during alerts
         # is the worst possible moment for a game session.
+        self._trace_prompt(f"triggered:{event.name}", system, user, "fast")
         return system, user, "fast"
 
     def build_observation(self):
@@ -319,6 +448,7 @@ class CommentaryEngine:
             )
         except Exception:
             return None, None, None
+        self._trace_prompt("observation", system, user, "fast")
         return system, user, "fast"
 
     def build_conversational(self, question):
@@ -330,4 +460,5 @@ class CommentaryEngine:
             )
         except Exception:
             return None, None, None
+        self._trace_prompt("conversational", system, user, "quality")
         return system, user, "quality"
