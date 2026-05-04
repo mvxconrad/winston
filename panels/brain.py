@@ -85,10 +85,6 @@ class BrainPanel:
         self._state = "UNKNOWN"
         self._last_event = None
         self._client = {}
-        # Vault snapshot — populated lazily, refreshed only when the
-        # vault directory's mtime changes so we don't stat 4 files at 1Hz.
-        self._vault = {"exists": False, "pages": [], "total_bytes": 0}
-        self._vault_mtime = 0
 
         # Dirty-tracking. Brain state changes rarely; we want the 1Hz
         # tick to be a near no-op when nothing's new so it doesn't
@@ -115,8 +111,7 @@ class BrainPanel:
         a synchronous redraw can starve the input widget at typing speed.
         """
         prev = (self._state, self._last_event,
-                self._client.get("queue_depth"),
-                self._vault.get("total_bytes"))
+                self._client.get("queue_depth"))
         try:
             self._state = self._get_state() or "UNKNOWN"
         except Exception:
@@ -130,23 +125,8 @@ class BrainPanel:
         except Exception:
             self._client = {}
 
-        # Refresh vault summary only when the directory has been touched
-        # since last check. Memory.save() rewrites the files, bumping
-        # mtime — that's our trigger.
-        try:
-            import os
-            from brain.vault import vault_summary, VAULT_DIR
-            if os.path.isdir(VAULT_DIR):
-                mt = os.path.getmtime(VAULT_DIR)
-                if mt > self._vault_mtime:
-                    self._vault_mtime = mt
-                    self._vault = vault_summary()
-        except Exception:
-            pass
-
         cur = (self._state, self._last_event,
-               self._client.get("queue_depth"),
-               self._vault.get("total_bytes"))
+               self._client.get("queue_depth"))
         self._dirty = (prev != cur) or self._first_tick
         self._first_tick = False
 
@@ -253,18 +233,24 @@ class BrainPanel:
             text.append("LAST   ", style=LABEL)
             text.append("nothing fired yet", style=DIM)
 
-        # ─── Vault line ─────────────────────────────────────────────
-        # The MD vault is the human-readable mirror of memory.json.
-        # Showing it here makes it discoverable — most users won't go
-        # digging through the filesystem to find it.
-        vault = self._vault or {}
-        if vault.get("exists"):
+        # ─── Memory summary line ────────────────────────────────────
+        # Direct view of memory.json — replaces the old vault summary.
+        # Shows what Winston has on file: known-app count, free-form
+        # notes, when memory was last refreshed from the CSV log.
+        if self._memory:
+            apps = self._memory.facts.get("apps") or {}
+            notes = self._memory.facts.get("notes") or []
+            last = self._memory.facts.get("last_learned")
             text.append("\n")
-            kb = vault.get("total_bytes", 0) / 1024
-            text.append("VAULT  ", style=LABEL)
-            text.append(f"{vault.get('path', 'vault')}/", style=MEDIUM)
-            text.append(f"  ({kb:.1f}KB, {len(vault.get('pages', []))} pages)",
-                        style=DIM)
+            text.append("MEMORY ", style=LABEL)
+            text.append(f"{len(apps)} apps", style=MEDIUM)
+            text.append(" · ", style=DIM)
+            text.append(f"{len(notes)} notes", style=MEDIUM)
+            if last:
+                # Just the time portion; full ISO timestamp is too long.
+                short = last[11:19] if "T" in last else last
+                text.append("  ", style=DIM)
+                text.append(f"learned {short}", style=DIM)
 
         return text
 

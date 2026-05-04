@@ -260,40 +260,157 @@ def trigger_network_burst(sections, baselines, cfg):
     return None
 
 
-# State for new_heavy_process — track the most recent top-1 process name
+# State for new_heavy_process —
+#   _last_top_proc[0]: name of the LAST process we fired on (so we don't
+#                       re-fire while the same process is still on top)
+#   _candidate:        (name, since_ts) for a candidate new top, used to
+#                       require sustained presence before firing. Without
+#                       this, a 1-tick spike (e.g. node briefly hitting
+#                       117% then dropping back to 5%) would fire the
+#                       trigger and Winston would announce a "new top"
+#                       that's already gone by the time he streams.
 _last_top_proc = [None]
+_candidate = [None, None]
+
 
 def trigger_new_heavy_process(sections, baselines, cfg):
-    """Top-1 process changed AND new top is using significant CPU."""
+    """Top-1 process (across WSL + Windows host) changed AND new top is heavy.
+
+    Merges procs.procs (WSL psutil) with procs.win_procs (PowerShell host
+    poller) so launching ArkAscended on Windows triggers this even though
+    WSL psutil sees nothing change. The merged list is sorted by CPU% and
+    we compare the new top-1 against the previous top-1.
+
+    Hysteresis: a new candidate must remain top-1 for `sustain_sec`
+    consecutive ticks (default 3 s) before we actually fire. This is the
+    fix for "node spiked to 117% for one second and Winston announced
+    a new top that no longer exists."
+    """
     procs = _find_panel(sections, "ProcessesPanel")
-    if procs is None or not procs.procs:
+    if procs is None:
         return None
 
-    # procs.procs is sorted descending by CPU, each tuple is (cpu, mem, name, pid)
-    top = procs.procs[0]
-    cpu_pct, mem_bytes, name, pid = top
+    merged = list(procs.procs or []) + list(getattr(procs, "win_procs", None) or [])
+    if not merged:
+        return None
+    merged.sort(key=lambda r: -r[0])
+
+    cpu_pct, mem_bytes, name, _pid = merged[0]
+    is_win = bool(procs.win_procs and merged[0] in procs.win_procs)
+    side = "Windows" if is_win else "WSL"
+    now = time.monotonic()
+    sustain = cfg.get("sustain_sec", 3)
 
     if cpu_pct < cfg["min_cpu_pct"]:
-        # Not heavy enough to be interesting — reset memory and skip
-        _last_top_proc[0] = name
+        # Not heavy this tick. Don't accept it as a baseline either —
+        # otherwise a brief lull would let a 117% spike one tick later
+        # qualify as "new top" again. Just clear any pending candidate.
+        _candidate[0], _candidate[1] = None, None
         return None
 
     if _last_top_proc[0] is None:
+        # First observation — establish a baseline so we don't fire on
+        # the very first tick. No candidate yet either.
         _last_top_proc[0] = name
-        return None  # first observation, no comparison possible
+        _candidate[0], _candidate[1] = None, None
+        return None
 
     if name == _last_top_proc[0]:
-        return None  # same process as before, not new
+        # Same as the last process we already announced (or seeded).
+        # Clear candidate so a transient blip doesn't accumulate state.
+        _candidate[0], _candidate[1] = None, None
+        return None
 
-    # New top process AND it's using significant CPU
+    # A different process is on top this tick. Does it match the
+    # candidate we've been watching, and has it been on top long enough?
+    if _candidate[0] != name:
+        # New candidate — start the clock.
+        _candidate[0], _candidate[1] = name, now
+        return None
+
+    # Same candidate continuing. Has it sustained long enough?
+    elapsed = now - (_candidate[1] or now)
+    if elapsed < sustain:
+        return None
+
+    # Sustained — commit the new top.
     prev = _last_top_proc[0]
     _last_top_proc[0] = name
+    _candidate[0], _candidate[1] = None, None
     mem_mb = mem_bytes / (1024 * 1024)
     return TriggerEvent(
         name="new_heavy_process",
         severity=cfg.get("severity", "notable"),
-        description=(f"New top process: {name} using {cpu_pct:.0f}% CPU "
-                     f"and {mem_mb:.0f}MB RAM (was {prev})."),
+        description=(f"{name} just took the top spot ({side}) at "
+                     f"{cpu_pct:.0f}% CPU, {mem_mb:.0f}MB RAM. "
+                     f"Held there for {elapsed:.0f}+ seconds. Was {prev}."),
+    )
+
+
+# State for host_app_busy — track when a Windows process first crossed
+# the threshold so we only fire after sustained usage (avoids alerting
+# on a one-second blip from a Discord notification or browser repaint).
+_host_busy_since = {}  # name → monotonic timestamp when it first crossed
+
+def trigger_host_app_busy(sections, baselines, cfg):
+    """A Windows-host process has sustained meaningful CPU usage.
+
+    Fills the gap that other triggers miss: when a Windows game runs,
+    psutil sees idle WSL (cpu_sustained_high doesn't fire), and the GPU
+    might not be hot enough yet (gpu_thermal doesn't fire), but the user
+    expects Winston to notice "ArkAscended at 15% CPU on Windows" — that
+    IS interesting because games matter, not because the threshold is
+    high in absolute terms.
+
+    Only the Windows side is checked (WSL side has cpu_sustained_high
+    + new_heavy_process covering it already).
+    """
+    procs = _find_panel(sections, "ProcessesPanel")
+    if procs is None:
+        return None
+    win = getattr(procs, "win_procs", None) or []
+    if not win:
+        return None
+
+    threshold_pct = cfg.get("min_cpu_pct", 10)
+    duration = cfg.get("duration_sec", 20)
+    now = time.monotonic()
+
+    # Find the busiest Windows process this tick.
+    win_sorted = sorted(win, key=lambda r: -r[0])
+    cpu_pct, mem_bytes, name, _pid = win_sorted[0]
+
+    # Drop stale entries from _host_busy_since so the dict doesn't grow
+    # forever as games come and go. Anything not currently above
+    # threshold gets cleared.
+    currently_busy = {n for c, _m, n, _p in win_sorted if c >= threshold_pct}
+    for stale in list(_host_busy_since):
+        if stale not in currently_busy:
+            del _host_busy_since[stale]
+
+    if cpu_pct < threshold_pct:
+        return None
+
+    if name not in _host_busy_since:
+        _host_busy_since[name] = now
+        return None  # just started — wait for sustained period
+
+    elapsed = now - _host_busy_since[name]
+    if elapsed < duration:
+        return None  # not sustained long enough yet
+
+    # Reset so we don't refire for the same continuous run; cooldown
+    # also gates this but resetting makes "fresh sustained period
+    # required" the post-fire behavior.
+    del _host_busy_since[name]
+
+    mem_mb = mem_bytes / (1024 * 1024)
+    return TriggerEvent(
+        name="host_app_busy",
+        severity=cfg.get("severity", "notable"),
+        description=(f"Windows-host process {name} has been at "
+                     f"{cpu_pct:.0f}% CPU for {elapsed:.0f}+ seconds "
+                     f"({mem_mb:.0f}MB RAM)."),
     )
 
 
@@ -310,6 +427,7 @@ TRIGGER_FUNCTIONS = {
     "memory_pressure":      trigger_memory_pressure,
     "network_burst":        trigger_network_burst,
     "new_heavy_process":    trigger_new_heavy_process,
+    "host_app_busy":        trigger_host_app_busy,
 }
 
 

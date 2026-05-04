@@ -3,195 +3,108 @@
 Two data sources, merged into one ranked list:
 
   1. WSL/Linux processes via psutil (always available; cheap)
-  2. Windows-host processes via PowerShell `Get-Process`, polled on a
-     daemon thread (only when running under WSL — otherwise irrelevant)
+  2. Windows-host processes via the shared poller in
+     `panels/host_processes.py` (only meaningful under WSL)
 
-Why both: when running under WSL, psutil only sees Linux-side processes.
-The user's actual high-CPU workload — Ark, Chrome, Discord, anything
-launched from Windows — is invisible to psutil. The PowerShell poller
-is the only way to see those, but spawning PowerShell on every UI tick
-would block the dashboard for 50–200ms per call (same issue NetworkPanel
-fought). So we spin up a daemon thread that polls every few seconds and
-caches the result; ProcessesPanel.update() reads the cache without ever
-crossing WSL→Windows on the UI thread.
+The Windows-side daemon thread lives in its own module so brain/* can
+also import the snapshot for prompts and memory learning. This panel
+is just one consumer of that shared cache.
 
-CPU% for Windows processes is computed by sampling cumulative CPU time
-across two PowerShell calls and dividing by elapsed time and core count
-(same definition psutil uses). The very first poll has no prior sample,
-so all win_procs report 0.0% CPU until the second poll completes.
+CSV columns include BOTH the merged top (so a Windows game shows up
+when it dominates) AND a separate top_winproc_* pair (so memory's
+log-learner can rank Windows apps even if a Linux process happened to
+be the global top at the moment of write).
 """
-import json
 import os
-import platform
-import shutil
-import subprocess
-import threading
-import time
-
 import psutil
 from rich.text import Text
 
 from panels.base import fmt_bytes
+from panels.host_processes import get_shared_poller
 from theme import LABEL, SECONDARY, BRIGHT, MEDIUM, DIM, heat_pct
 
 
-# ──────────────── WSL → Windows host poller ────────────────
-# Same lessons as panels/network.py:
-# - Spawn cost (~50-200ms) makes a UI-thread call unacceptable
-# - Daemon thread + cached result keeps the UI free
-# - 5s interval is the sweet spot for WSL→Windows polling
-WIN_POLL_INTERVAL_SEC = 5.0
-WIN_PROC_LIMIT = 30   # cap on PowerShell-side rows; merged list is then capped further
-
-
-def _is_wsl():
-    if platform.system() != "Linux":
-        return False
-    try:
-        with open("/proc/version", "r") as f:
-            content = f.read().lower()
-            return "microsoft" in content or "wsl" in content
-    except OSError:
-        return False
-
-
-_POWERSHELL_FALLBACK_PATHS = [
-    "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
-    "/mnt/c/Program Files/PowerShell/7/pwsh.exe",
-    "/mnt/c/Windows/SysWOW64/WindowsPowerShell/v1.0/powershell.exe",
-]
-
-
-def _find_powershell():
-    found = shutil.which("powershell.exe")
-    if found:
-        return found
-    for path in _POWERSHELL_FALLBACK_PATHS:
-        if os.path.exists(path):
-            return path
-    return None
-
-
-# Compact PowerShell command — one process per object, JSON output. We
-# read CPU as cumulative seconds (Windows TotalProcessorTime) and turn
-# that into a % across two consecutive samples on the Linux side.
+# ──────────────── Process-name enrichment ────────────────
+# psutil reports `name` as the executable basename ("python3"). On a dev
+# machine the user has 5 different python processes running and the
+# "python3 / python3 / python3" rows are useless — the user can't tell
+# which is Winston, which is a Jupyter kernel, which is some random tool.
 #
-# `Get-Process | ... | Select Id, ProcessName, CPU, WorkingSet64` is
-# fast (cumulative — no sampling delay) but `CPU` here is total seconds,
-# not a rate. We compute the rate ourselves between polls.
-_PS_COMMAND = (
-    "$ErrorActionPreference='SilentlyContinue';"
-    "Get-Process | Where-Object { $_.CPU -ne $null } |"
-    f"  Sort-Object -Descending WorkingSet64 |"
-    f"  Select-Object -First {WIN_PROC_LIMIT} Id, ProcessName, CPU, WorkingSet64 |"
-    "  ConvertTo-Json -Compress -Depth 2"
-)
+# Solution: when the process is a generic interpreter (python, node,
+# bash, etc.), look at the cmdline and extract the script being run.
+# `python3 winston.py --gui`  → "winston.py"
+# `node /path/to/server.js`   → "server.js"
+# We also tag the process that IS Winston (this PID and its parent's
+# children, which would catch the Ollama worker thread if it forked) with
+# [self] so it's obvious which row is "us watching ourselves".
+_WINSTON_PID = os.getpid()
+
+# Interpreters whose executable name tells you nothing on its own.
+# Anything else, we leave the name as-is.
+_GENERIC_INTERPRETERS = frozenset({
+    "python", "python2", "python3", "python.exe", "python3.exe",
+    "node", "nodejs", "node.exe",
+    "bash", "sh", "zsh", "fish",
+    "ruby", "perl",
+    "java",
+    "powershell.exe", "pwsh.exe",
+})
 
 
-def _poll_windows_processes(ps_path):
-    """Run one PowerShell snapshot. Returns list of dicts:
-       [{"Id":1234, "ProcessName":"chrome", "CPU":42.13, "WorkingSet64":12345678}, ...]
-    or [] on any failure (timeout, broken JSON, no PS, etc.)."""
-    if not ps_path:
-        return []
-    try:
-        result = subprocess.run(
-            [ps_path, "-NoProfile", "-NonInteractive", "-Command", _PS_COMMAND],
-            capture_output=True, timeout=10, text=True,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return []
-    if result.returncode != 0 or not result.stdout.strip():
-        return []
-    try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return []
-    # PowerShell returns either a single dict (one row) or a list. Normalize.
-    if isinstance(data, dict):
-        data = [data]
-    out = []
-    for row in data:
-        try:
-            pid = int(row.get("Id", 0))
-            name = str(row.get("ProcessName", "") or "")
-            cpu_total_sec = float(row.get("CPU") or 0.0)
-            mem = int(row.get("WorkingSet64") or 0)
-            out.append({"pid": pid, "name": name,
-                        "cpu_total_sec": cpu_total_sec, "mem": mem})
-        except (TypeError, ValueError):
-            continue
-    return out
+def _enrich_name(pid, base_name):
+    """Turn a generic interpreter name into something meaningful.
 
+    Cheap when the name isn't generic — we don't open /proc/<pid>/cmdline
+    on every process, only on the ones that need disambiguating.
 
-class _HostProcessPoller(threading.Thread):
-    """Daemon thread that snapshots Windows processes every WIN_POLL_INTERVAL_SEC.
-
-    Results are cached as `self.latest`: a list of (cpu_pct, mem, name, pid)
-    tuples — same shape ProcessesPanel uses for psutil rows. CPU% is computed
-    from the delta between consecutive samples so the units match psutil.
+    Two-step:
+      1. If `base_name` is a generic interpreter (python3, node, …),
+         look at cmdline and append the script — `python3 (winston.py)`.
+      2. If the pid IS this Winston process, append `[self]` so the user
+         can spot which row is the dashboard itself.
+    Both can apply: `python3 (winston.py) [self]`.
     """
-
-    def __init__(self, ps_path):
-        super().__init__(name="winston-winproc-poller", daemon=True)
-        self._ps_path = ps_path
-        self._stop = threading.Event()
-        self._lock = threading.Lock()
-        self.latest = []  # [(cpu_pct, mem, name, pid), ...]
-        # PID → (timestamp, cumulative_cpu_seconds) for delta math.
-        self._prev = {}
-        # Logical CPU count for "1.0% per core" → "fraction of total" math.
+    name = base_name or "?"
+    # Step 1: cmdline-based enrichment for generic interpreters.
+    if base_name and base_name.lower() in _GENERIC_INTERPRETERS:
         try:
-            self._cpu_count = max(1, psutil.cpu_count(logical=True) or 1)
-        except Exception:
-            self._cpu_count = 1
+            cmdline = psutil.Process(pid).cmdline()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            cmdline = None
+        if cmdline:
+            # Find the first arg that looks like a script (skip flags
+            # like -u, -m module, --no-color). For "python -m foo" we
+            # pick "(-m foo)"; for "python winston.py" we pick
+            # "(winston.py)". Falls through with no enrichment if
+            # everything in args is a flag.
+            args = cmdline[1:]
+            i = 0
+            while i < len(args):
+                arg = args[i]
+                if arg == "-m" and i + 1 < len(args):
+                    name = f"{base_name} (-m {args[i+1]})"
+                    break
+                if arg == "-c":
+                    name = f"{base_name} (-c)"
+                    break
+                if arg.startswith("-"):
+                    i += 1
+                    continue
+                name = f"{base_name} ({os.path.basename(arg)})"
+                break
 
-    def stop(self):
-        self._stop.set()
-
-    def run(self):
-        while not self._stop.is_set():
-            t0 = time.monotonic()
-            rows = _poll_windows_processes(self._ps_path)
-            now = time.monotonic()
-            tuples = []
-            new_prev = {}
-            for r in rows:
-                pid = r["pid"]
-                cpu_total = r["cpu_total_sec"]
-                prev = self._prev.get(pid)
-                if prev is not None:
-                    prev_t, prev_cpu = prev
-                    elapsed = max(0.001, now - prev_t)
-                    delta = max(0.0, cpu_total - prev_cpu)
-                    # Match psutil: 100% per core * num_cores possible.
-                    cpu_pct = (delta / elapsed) * 100.0 / self._cpu_count
-                else:
-                    cpu_pct = 0.0
-                new_prev[pid] = (now, cpu_total)
-                tuples.append((cpu_pct, r["mem"], r["name"], pid))
-            self._prev = new_prev
-            tuples.sort(key=lambda t: -t[0])
-            with self._lock:
-                self.latest = tuples
-            # Sleep the rest of the interval, watching for stop.
-            elapsed = time.monotonic() - t0
-            wait = max(0.1, WIN_POLL_INTERVAL_SEC - elapsed)
-            if self._stop.wait(wait):
-                return
-
-    def snapshot(self):
-        with self._lock:
-            return list(self.latest)
+    # Step 2: tag self LAST so it's always visible regardless of step 1.
+    if pid == _WINSTON_PID:
+        name = f"{name} [self]"
+    return name
 
 
-# ──────────────── Panel ────────────────
 class ProcessesPanel:
-    """Top-N table merging Linux psutil rows + Windows host rows (via poller).
+    """Top-N table merging Linux psutil rows + Windows host rows.
 
     Attributes used by views:
       procs:     list[(cpu_pct, mem, name, pid)]   — psutil-side, every update()
-      win_procs: list[(cpu_pct, mem, name, pid)]   — PowerShell-side, daemon-cached
+      win_procs: list[(cpu_pct, mem, name, pid)]   — host-side, daemon-cached
       limit:     max rows shown by the consuming view
     """
 
@@ -199,20 +112,9 @@ class ProcessesPanel:
         self.limit = limit
         self.procs = []
         self.win_procs = []
-        self._poller = None
-
-        # Spin up the Windows poller only when:
-        #   - we're on WSL (otherwise irrelevant)
-        #   - user hasn't disabled threads via env var
-        #   - PowerShell is actually findable
-        self._stop_event = threading.Event()
-        no_threads = (os.environ.get("WINSTON_NO_THREADS")
-                      or os.environ.get("WINSTON_NO_HOST_PROCS"))
-        if _is_wsl() and not no_threads:
-            ps_path = _find_powershell()
-            if ps_path:
-                self._poller = _HostProcessPoller(ps_path)
-                self._poller.start()
+        # Hand off the daemon-thread lifecycle to the shared module so
+        # both this panel and brain/* read the same cache.
+        self._poller = get_shared_poller()
 
     @property
     def title(self):
@@ -229,11 +131,22 @@ class ProcessesPanel:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
         procs.sort(key=lambda p: -p[0])
+        # self.procs holds RAW psutil names. Display-time enrichment
+        # (`python3 (winston.py) [self]`) happens in render() / GUI views
+        # via display_name() so the CSV log stays clean — otherwise the
+        # enriched string ends up as a "tracked app" in memory.json.
         self.procs = procs[:self.limit]
-        # Pull whatever the poller has cached. Empty list until the
-        # poller's first sample-pair completes (~5s after launch).
+
+        # Pull whatever the shared poller has cached. Empty list until
+        # the poller's first sample-pair completes (~5s after launch).
         if self._poller is not None:
             self.win_procs = self._poller.snapshot()[:self.limit]
+
+    @staticmethod
+    def display_name(pid, raw_name):
+        """Display-time name enrichment. Cheap (cmdline read only on the
+        top-N rows). Frontends call this when rendering each row."""
+        return _enrich_name(pid, raw_name)
 
     def render(self, width=None):
         # TUI render path — keeps backwards compatibility with cli/display.py.
@@ -245,8 +158,13 @@ class ProcessesPanel:
                     style=SECONDARY)
 
         # Same merge ProcessesView does, but render to Rich Text.
-        merged = [(cpu, mem, name, pid, "lin") for cpu, mem, name, pid in self.procs]
-        merged += [(cpu, mem, name, pid, "win") for cpu, mem, name, pid in self.win_procs]
+        # Linux side: enrich raw psutil names at render time so CSV stays
+        # clean. Windows side: enrichment N/A (PowerShell already gives
+        # us proper process names like ArkAscended).
+        merged = [(cpu, mem, _enrich_name(pid, name), pid, "lin")
+                  for cpu, mem, name, pid in self.procs]
+        merged += [(cpu, mem, name, pid, "win")
+                   for cpu, mem, name, pid in self.win_procs]
         merged.sort(key=lambda r: -r[0])
         merged = merged[:max(self.limit, 14)]
 
@@ -268,14 +186,34 @@ class ProcessesPanel:
 
         return text
 
+    # ──────────────── CSV log ────────────────
+    # Two pairs of columns:
+    #   top_proc_*    — single global top across both sources (back-compat
+    #                   with older log-learners; useful as "what was loud")
+    #   top_winproc_* — top WINDOWS process specifically, so the memory
+    #                   learner can build an app ranking that includes
+    #                   games + browsers, not just whatever Linux process
+    #                   happened to be busy at sample time.
     def csv_headers(self):
-        return ["top_proc_name", "top_proc_cpu"]
+        return ["top_proc_name", "top_proc_cpu",
+                "top_winproc_name", "top_winproc_cpu"]
 
     def csv_columns(self):
-        # Top across both sources, so the CSV captures Windows-host load
-        # too — important so brain.memory's learn_from_log can see games.
+        # Global top (across Linux + Windows).
         merged = list(self.procs) + list(self.win_procs)
-        if not merged:
-            return ["", 0.0]
-        merged.sort(key=lambda p: -p[0])
-        return [merged[0][2], merged[0][0]]
+        if merged:
+            merged.sort(key=lambda p: -p[0])
+            top_name, top_cpu = merged[0][2], merged[0][0]
+        else:
+            top_name, top_cpu = "", 0.0
+
+        # Windows-only top — picks the busiest, but if everyone's idle,
+        # the WindowsProcessPoller returns rows sorted by working-set
+        # (memory), so we still get the dominant memory-resident app
+        # (e.g. Ark when it's loaded but currently waiting on input).
+        if self.win_procs:
+            wname, wcpu = self.win_procs[0][2], self.win_procs[0][0]
+        else:
+            wname, wcpu = "", 0.0
+
+        return [top_name, top_cpu, wname, wcpu]

@@ -236,10 +236,28 @@ TRIGGERS = {
     },
 
     # New heavy process — top-1 process changed AND new top is significant.
+    # Now WSL+Windows-aware: a Windows-host game becoming top-1 fires this.
     "new_heavy_process": {
         "enabled":              True,
         "cooldown_sec":         120,
         "min_cpu_pct":          20,    # must be using at least this much CPU
+        "sustain_sec":          3,     # AND must hold the top spot this long
+                                       # (kills 1-tick spikes like a node burst
+                                       # to 117% that's gone before Winston
+                                       # can stream a comment about it)
+        "severity":             "notable",
+    },
+
+    # Windows-host app sustained busy — fills the gap that other triggers
+    # miss for games. WSL psutil sees idle (no cpu_sustained_high) and the
+    # GPU may not be hot enough yet (no gpu_thermal), but a Windows process
+    # holding 10%+ CPU for 20s IS interesting because games matter to the
+    # user, not because the absolute number is high.
+    "host_app_busy": {
+        "enabled":              True,
+        "cooldown_sec":         300,   # only mention each game-session once per 5 min
+        "min_cpu_pct":          10,    # Ark idles around 15-20% in menus
+        "duration_sec":         20,    # sustained — avoid blip-on-launch firings
         "severity":             "notable",
     },
 }

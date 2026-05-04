@@ -5,13 +5,16 @@
   <b>T</b>ranslating &nbsp;·&nbsp; <b>O</b>bserved &nbsp;·&nbsp; <b>N</b>umbers
 </p>
 
-A personal system monitor with a local-LLM butler. Watches CPU, RAM, GPU, disks, network, temperatures, and processes. Logs everything to CSV. Ollama reads the panel state and writes dry, observant commentary — both on a heartbeat and event-driven when something noteworthy happens. Two frontends share the same engine: a PyQt6 desktop app (`--gui`) and a Textual TUI (default).
+<p align="center"><i>Most system monitors show numbers. Winston watches the same numbers, learns what they mean for you, and talks about your machine like a person who knows you would.</i></p>
+
+A personal system monitor with a local-LLM butler. Watches CPU, RAM, GPU, disks, network, temperatures, and processes. Logs everything to CSV. A local Ollama model reads panel state and writes commentary that **gets more personal over time** — what apps you run, how you feel about them, when you run them, what your machine usually looks like. The bridge between raw hardware telemetry and useful observation is persistent memory ([see Memory](#memory)). Two frontends share the same engine: a PyQt6 desktop app (`--gui`) and a Textual TUI (default).
 
 ## Quick links
 
 - [Run it](#run)
 - [Panels](#panels)
-- [Commentary, memory, and tiered LLM](#commentary-memory-and-tiered-llm)
+- [LLM commentary](#llm-commentary)
+- [Memory](#memory) — what makes Winston more than a fancy `top`
 - [Architecture](#architecture)
 - [WSL setup (temps + network)](#wsl-setup-temps--network)
 - [Diagnostic env vars](#diagnostic-env-vars)
@@ -27,7 +30,7 @@ A personal system monitor with a local-LLM butler. Watches CPU, RAM, GPU, disks,
 `python winston.py --gui` — native PyQt6 window, GPU-accelerated charts via pyqtgraph, scrollable, smooth at 60 fps even while gaming.
 
 ![Winston GUI](docs/winston_gui_v1.png)
-*Same panels as the TUI plus the BRAIN view (state · model · top apps · vault).*
+*Same panels as the TUI plus the BRAIN view (state · model · top apps · memory stats).*
 
 ## CLI (TUI)
 
@@ -67,17 +70,19 @@ All tunables live in `config.py` (refresh rates, LLM behavior, trigger threshold
 | **NETWORK** | renders 2 Hz, host source polled **every 5 s** | Windows host stats via PowerShell (sees Chrome traffic). 5 s is intentional — see [the investigation](#investigation-networkpanel-and-dropped-keystrokes) below. |
 | **PROCESSES** | 1 Hz | Top 14 by CPU, merged from psutil (Linux/WSL) + PowerShell `Get-Process` (Windows host, daemon-cached every 5 s). Windows rows tagged `[win]`. |
 | **COMMENTARY** | event-driven | LLM-generated; see next section. |
-| **BRAIN** | 1 Hz, dirty-checked | Winston's internal state — current model, top apps from memory, last trigger fired, MD vault summary. Toggleable via `SHOW_BRAIN_PANEL`. |
+| **BRAIN** | 1 Hz, dirty-checked | Winston's internal state — current model, top apps from [memory](#memory), last trigger fired, memory.json stats. Toggleable via `SHOW_BRAIN_PANEL`. |
 
-## Commentary, memory, and tiered LLM
+## LLM commentary
 
 A local Ollama model reads panel state and writes dry one-liners. Three trigger paths:
 
 1. **Startup ritual** — time-aware greeting (`Good morning, max.` / `Up late tonight, max?`) followed by a one-line retrospective from the last 24h of logs.
-2. **Event-driven** — `brain/triggers.py` evaluates per-second triggers (single core pegged, sustained CPU, thermal alerts, memory pressure, network burst, new heavy process). When one fires, Winston comments on the specific event.
+2. **Event-driven** — `brain/triggers.py` evaluates per-second triggers (single core pegged, sustained CPU, thermal alerts, memory pressure, network burst, new heavy process, host app busy). When one fires, Winston comments on the specific event. Hysteresis on `new_heavy_process` (sustain_sec=3) kills 1-tick spike announcements.
 3. **Heartbeat** — every `HEARTBEAT_INTERVAL_SEC` (default 5 min) a routine status comment so Winston isn't silent during quiet periods.
 
 Output streams token-by-token via a typewriter buffer (decouples LLM gen rate from display rate). Press `/` to focus the ASK input and ask a question — last 3 Q&A pairs are kept as multi-turn context.
+
+Every prompt is personalized from [memory](#memory) — Winston sees what you call each app (`nickname`), what kind of thing it is (`type`), how you feel about it (`feeling`), and what your machine usually looks like, so his commentary references *you* instead of restating telemetry.
 
 ### Tiered model loading (so VRAM stays free for games)
 
@@ -90,11 +95,78 @@ Both models default to `keep_alive=0` — they load on demand, generate the answ
 
 You'll see "thinking…" for that brief window each time Winston has something to say. Bump `LLM_FAST_KEEP_ALIVE_SEC` or `LLM_QUALITY_KEEP_ALIVE_SEC` in `config.py` (e.g. to 60-300) if you want quick follow-ups at the cost of VRAM idle.
 
-### Persistent memory + MD vault
+## Memory
 
-`brain/memory.py` keeps a JSON file at `logs/memory.json` (gitignored) — top apps from log scan, behavioral fingerprints (avg CPU/GPU when each app is top-1), machine facts (CPU, GPU, RAM). Threaded into every prompt builder so commentary is personalized.
+What makes Winston more than a fancy `top`. The dashboard shows numbers; memory is what lets him *recognize* what those numbers mean for you. `logs/memory.json` is the canonical store. Two ways things end up there:
 
-On every save the same facts are mirrored to `vault/{index,user,machine,apps}.md` — a human-readable markdown vault you can open in Obsidian, Logseq, or `cat`. JSON is canonical; the vault is derived. The BRAIN panel shows the vault path + page count so it stays discoverable.
+**1. Auto-derived from observation.** Every second the CSV log gains a row. `learn_from_log()` scans the last 7 days and ranks apps by how long they were the top process — building per-app fingerprints (avg CPU, peak CPU, avg GPU when this app was top, hours seen). Runs on launch.
+
+**2. User-told in conversation.** When you tell Winston something — *"Ark is my favorite game"* — he ends his reply with an invisible marker that gets parsed, stripped from the displayed text, and applied to memory:
+
+- `[APP: <process-name> key=value, key=value, -dropkey]` — per-app structured attrs. Multiple keys allowed, **they merge** (setting `nickname=Ark` doesn't erase a prior `feeling=favorite`). Prefix `-key` to drop a single attr.
+- `[REMEMBER: <fact>]` — free-form note about you that doesn't bind to one app.
+- `[FORGET: <existing note>]` — revoke a saved note.
+
+Markers are physically cut from the streaming buffer the moment the closing `]` arrives, so the user never sees them flicker. Same treatment for "Now let's respond:" planning preambles the model occasionally leaks.
+
+### What memory looks like
+
+```json
+{
+  "user": { "name": "max" },
+  "machine": { "host": "PC", "cpu": "...", "gpu": "...", "ram_gb": 30.9 },
+  "apps": {
+    "arkascended": {
+      "name": "ArkAscended",      // canonical (locked, never renamed)
+      "hours": 0.45,              // ↓ AUTO from CSV scan
+      "avg_cpu": 16.5,
+      "peak_cpu": 41.6,
+      "avg_gpu_when_top": 39.1,
+      "nickname": "Ark",          // ↓ user-told via [APP:] markers
+      "type": "game",
+      "feeling": "favorite"
+    }
+  },
+  "notes": [
+    { "ts": "...", "text": "max is gaming whenever ArkAscended is running", "source": "user" }
+  ]
+}
+```
+
+`AUTO_APP_KEYS` (name, hours, avg_cpu, peak_cpu, avg_gpu_when_top) come first in each entry's JSON; user-added keys append after. `learn_from_log` rebuilds the auto fields on each scan but preserves user keys.
+
+### Suggested attribute keys
+
+Not enforced — Winston can invent his own when nothing fits.
+
+| Key | What | Example values |
+| --- | --- | --- |
+| `nickname` | What you call it | `Ark`, `Doom`, `vscode` |
+| `type` | What kind of app | `game`, `ide`, `browser`, `comm`, `music`, `dev` |
+| `feeling` | How you feel about it | `favorite`, `hate`, `necessary`, `fun` |
+| `role` | When/why it runs | `work`, `leisure`, `background`, `daily` |
+| `launched_via` | How it gets started | `steam`, `epic`, `manually`, `cron` |
+| `notes` | Short per-app fact | `"crashes on launch"`, `"streaming only"` |
+
+### Robustness — input forgiveness, no hardcoded user data
+
+Winston isn't perfect at marker syntax. The memory layer corrects on the fly:
+
+- **Suffix stripping** — `_normalize_app_key("ArkAscended.exe")` → `arkascended`. Same canonical key whether the model writes the `.exe` or not.
+- **Nickname-aware lookup** — `[APP: Ark ...]` after `nickname=Ark` is set finds the existing entry, doesn't fork a duplicate.
+- **Unique prefix matching** — `[APP: Ark ...]` lands on `arkascended` if no other key starts with "ark". 3-char floor + uniqueness requirement keep "node" from accidentally swallowing "nodejs".
+- **Attribute bucket auto-correction** — `type=favorite` (mis-bucketed; "favorite" is a feeling-word) auto-swaps to `feeling=favorite`. Vocabularies are starter sets; new values pass through unchanged.
+- **Migration on load** — older memory.json files with `.exe` duplicates, orphan short-name entries, mis-bucketed attrs, or angle-bracket placeholder leaks (`<max>`) get cleaned up automatically when the file loads.
+
+### How prompts read memory
+
+The personality block at the top of each prompt is built from memory. Apps render with **user-told facts FIRST**, auto stats trail in parens. Nicknames replace canonical names so the model sees "Ark" not "ArkAscended" in the snapshot. Notes auto-flip from third-person storage to second-person at render time ("max codes at night" stored → "you code at night" in the prompt) so the model addresses you, not a third party. The user's name is read from `memory.get_user_name()` — nothing about the prompt is hardcoded to a specific person.
+
+### How to inspect
+
+- **BRAIN panel** — top apps + last trigger + `MEMORY N apps · M notes · learned HH:MM:SS`.
+- **`cat logs/memory.json`** — full store, hand-readable.
+- **`tail -f logs/reasoning.log`** — every prompt and response in real-time, with markers Winston emitted (and what they did to memory).
 
 ## Architecture
 
@@ -224,15 +296,16 @@ panels/                 # data layer — SHARED across frontends
 
 brain/                  # LLM layer — SHARED across frontends
   client.py             # Ollama client; FIFO worker thread
-  prompt.py             # all prompt builders
+  prompt.py             # all prompt builders + personality block
   baselines.py          # rolling mean/stddev for anomaly detection
-  triggers.py           # the 7 trigger functions + TriggerRunner
+  triggers.py           # trigger functions + TriggerRunner
   history.py            # single-pass O(n) CSV scanner
-  memory.py             # persistent JSON-backed user memory
-  vault.py              # MD mirror of memory.json — vault/*.md regenerated on save
+  memory.py             # persistent JSON-backed memory + marker pipeline.
+                        # See [Memory](#memory).
   commentary_engine.py  # backend-agnostic orchestrator — state machine,
                         # trigger evaluation, heartbeat, stale-quiet,
-                        # Q&A history. Both frontends consume this.
+                        # Q&A history, marker parsing/cutting on stream.
+                        # Both frontends consume this.
 
 cli/                    # TUI frontend — only renders engine state
   display.py            # Textual app + CommentaryPanel renderer
@@ -244,11 +317,8 @@ gui/                    # desktop frontend — only renders engine state
 logs/                   # gitignored
   raw/observations.csv  # 1 row/sec time-series CSV
   memory.json           # canonical persistent memory
-  reasoning.jsonl       # every prompt + response (canonical, machine-parseable)
+  reasoning.jsonl       # every prompt + response (machine-parseable)
   reasoning.log         # same events, human-readable mirror
-
-vault/                  # gitignored — markdown mirror of memory.json
-  index.md · user.md · machine.md · apps.md
 ```
 
 **Adding a panel:** drop a class in `panels/` with `update()`, `render(width=None)`, `csv_headers()`, `csv_columns()`. Add it to the section list in `winston.py` and a layout slot in BOTH `cli/display.py` (`compose()`) and `gui/main.py` (`WinstonGui.__init__` row layout). The data class is shared.

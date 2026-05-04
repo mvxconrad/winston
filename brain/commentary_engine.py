@@ -61,8 +61,229 @@ on_done / on_error.
 """
 import json
 import os
+import re
 import time
 from datetime import datetime
+
+
+# ──────────────── Memory-marker parsing ────────────────
+# Winston writes markers at the end of his responses to update his own
+# memory. They look like:
+#
+#   [REMEMBER: max usually codes at night]
+#       Free-form fact about the user. Stored in memory.notes.
+#
+#   [APP: <name> key=val, key=val, -dropkey]
+#       Structured attrs on an app. Multi-key, MERGES with existing
+#       attrs (so setting `nickname=ark` doesn't blow away `feeling=favorite`).
+#       Prefix a key with `-` to delete it.
+#
+#   [FORGET: <text of an existing note>]
+#       Removes a previously-saved note (text matched case-insensitively).
+#
+# We strip every marker from the displayed text and route the payload
+# to the right Memory.* method.
+_MARKER_RE = re.compile(
+    r"\[(REMEMBER|APP|FORGET)\s*:\s*(.+?)\]",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _parse_app_marker(payload):
+    """Parse the body of an [APP: ...] marker into (name, attrs_dict).
+
+    Format: `<name> key1=val1, key2=val2, -dropkey`
+      - Name is the first whitespace-separated token. Used to look up
+        the app entry; the canonical `name` field is NEVER renamed by
+        markers (we keep CSV-derived process names stable so they keep
+        matching incoming process events).
+      - Rest is comma-separated. Each item is either:
+          key=value   → set attrs[key] = value
+          -key        → delete attrs[key] (encoded as None for set_app_attrs)
+      - Special: if the model passes `name=X`, we silently redirect it
+        to `nickname=X` — Winston's intent is "call it X going forward",
+        which is what nickname is for. The canonical `name` stays put.
+      - Values can contain spaces but not commas.
+      - Keys are lowercased; values keep their case.
+
+    Returns (None, None) if the payload can't be parsed.
+    """
+    payload = payload.strip()
+    if not payload:
+        return None, None
+    # Split off the app name (first word).
+    parts = payload.split(None, 1)
+    name = parts[0]
+    rest = parts[1] if len(parts) > 1 else ""
+    attrs = {}
+    if rest:
+        for chunk in rest.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if chunk.startswith("-"):
+                key = chunk[1:].strip().lower()
+                # Prevent deletion of the canonical name too.
+                if key and key != "name":
+                    attrs[key] = None  # delete sentinel
+                continue
+            if "=" in chunk:
+                k, v = chunk.split("=", 1)
+                k = k.strip().lower()
+                v = v.strip()
+                if not k:
+                    continue
+                # Lock canonical name. The model wanting to rename → goes
+                # to nickname instead. If a nickname is also being set in
+                # the same marker, the explicit nickname wins.
+                if k == "name":
+                    if "nickname" not in attrs:
+                        attrs["nickname"] = v
+                    continue
+                attrs[k] = v
+    return name, attrs
+
+
+def _extract_markers(text):
+    """Pull every [REMEMBER:]/[APP:]/[FORGET:] marker out of `text`.
+
+    Returns (cleaned_text, markers) where markers is a list of
+    (kind, payload) tuples. cleaned_text has markers removed plus any
+    trailing whitespace/blank lines they left behind tidied up.
+    """
+    markers = []
+    for m in _MARKER_RE.finditer(text):
+        markers.append((m.group(1).upper(), m.group(2).strip()))
+    cleaned = _MARKER_RE.sub("", text)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, markers
+
+
+# ──────────────── Preamble / wrapper detection ────────────────
+# Models occasionally leak internal narration into the response:
+#   "Got it! Let's update the references. Now, let's respond to the
+#    user: \"Sure, from now on..."
+# That whole prefix up to the inner-quoted reply is garbage from the
+# user's POV. We detect it during streaming so the typewriter can skip
+# past it instead of typing it out then deleting on finalize.
+
+# Patterns we know mean "what follows is the real response":
+_RESPOND_NOW_RE = re.compile(
+    r"(?:Now,?\s*)?(?:Let'?s|I'?ll|I\s+will)\s+(?:respond\s+to\s+(?:the\s+)?user|reply|answer)\s*[:\-]\s*",
+    re.IGNORECASE,
+)
+# A whole-message wrapping quote: starts with " and ends with ", with
+# nothing more outside. We strip both quotes after marker-extraction.
+_FULL_WRAP_QUOTES_RE = re.compile(r'^[\s\n]*"\s*(.+?)\s*"[\s\n]*$', re.DOTALL)
+# Planning preambles to drop when they sit at the start of the buffer.
+# Each match consumes everything up through the ending punctuation of
+# the planning sentence.
+_PLANNING_PREFIX_RE = re.compile(
+    r"^\s*(?:Got\s+it[!.]?\s+)?"
+    r"(?:Let'?s|Let\s+me|Now,?\s*let'?s|And\s+(?:then\s+)?let'?s|Now\s+I'?ll)\s+"
+    r"(?:think|update|consider|infer|note|address|process|reflect|review|look|see|do|move\s+on|respond)\b"
+    r"[^.\n]*[.\n:]",
+    re.IGNORECASE,
+)
+
+
+def _find_skip_target(buffer, current_typed):
+    """If the buffer at `current_typed` starts with a recognized planning/
+    wrapper preamble, return the byte index AFTER it so the typewriter
+    can jump past. Returns None when nothing skippable is detected.
+
+    Called every typewriter tick. Cheap — short regex matches anchored
+    to current position.
+    """
+    if current_typed >= len(buffer):
+        return None
+
+    # Pattern 1: explicit "Now let's respond to the user:" — skip past it
+    # AND past any opening " that follows, so the visible content is the
+    # actual reply rather than `"Sure, from now on..."`.
+    sub = buffer[current_typed:]
+    m = _RESPOND_NOW_RE.search(sub)
+    if m and m.start() < 200:  # don't skip over half a paragraph
+        end = current_typed + m.end()
+        # Skip a single opening quote if present.
+        if end < len(buffer) and buffer[end] in '"“\'':
+            end += 1
+        return end
+
+    # Pattern 2: planning preamble at the start ("Got it! Let me update...")
+    # Only fires when current_typed is still close to 0 — a one-liner
+    # leak at the top of the response.
+    if current_typed < 80:
+        m2 = _PLANNING_PREFIX_RE.match(sub)
+        if m2:
+            end = current_typed + m2.end()
+            # Eat trailing whitespace/newlines.
+            while end < len(buffer) and buffer[end] in " \t\r\n":
+                end += 1
+            return end
+
+    return None
+
+
+def _strip_wrappers(text):
+    """Final cleanup at message-finalize. Removes a wrapping pair of quotes
+    when the entire reply is one quoted block, plus any trailing planning
+    preambles that the streaming filter didn't catch."""
+    if not text:
+        return text
+    m = _FULL_WRAP_QUOTES_RE.match(text)
+    if m:
+        text = m.group(1).strip()
+    else:
+        # Streaming-time preamble skip can eat the leading " of a wrapped
+        # reply, leaving a dangling trailing ". Strip it so the message
+        # doesn't render with a stray quote at the end. Same for stray
+        # leading " when only one side survived.
+        text = re.sub(r'^[\s]*["“]\s*(?=\S)', "", text)
+        text = re.sub(r'\s*["”]\s*$', "", text)
+    # Strip trailing closer phrases that leaked despite the prompt rules.
+    text = re.sub(
+        r"(?:\s*(?:How\s+can\s+I\s+assist[^.?!]*[.?!]"
+        r"|Let\s+me\s+know\s+if[^.?!]*[.?!]"
+        r"|Hope\s+this\s+helps[^.?!]*[.?!]?))$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    return text
+
+
+def _apply_markers(memory, markers):
+    """Route extracted markers to the right Memory.* method.
+
+    No-op when memory is None. Returns a summary dict so we can log
+    what Winston decided to learn into the reasoning trace.
+    """
+    summary = {"added": 0, "attrs_changed": 0, "forgotten": 0}
+    if memory is None or not markers:
+        return summary
+    for kind, payload in markers:
+        try:
+            if kind == "REMEMBER":
+                if memory.add_note(payload, source="user"):
+                    summary["added"] += 1
+            elif kind == "APP":
+                name, attrs = _parse_app_marker(payload)
+                if name and attrs:
+                    if memory.set_app_attrs(name, attrs):
+                        summary["attrs_changed"] += 1
+            elif kind == "FORGET":
+                summary["forgotten"] += memory.forget_note(payload)
+        except Exception:
+            # Never let a malformed marker break the stream finalization.
+            continue
+    if any(summary.values()):
+        try:
+            memory.save()
+        except Exception:
+            pass
+    return summary
 
 
 # ──────────────── Reasoning trace log ────────────────
@@ -336,6 +557,11 @@ class CommentaryEngine:
         self.streaming_buffer = ""
         self.typed_chars = 0
         self.stream_complete = False
+        # Markers found mid-stream are physically REMOVED from the
+        # buffer (so the user never sees them flicker), but we still
+        # need their payloads at finalize-time to apply to memory.
+        # Stash them here as (kind, payload) tuples.
+        self._stream_markers = []
         self.state = "THINKING"
         self._stream_started_at = time.monotonic()
 
@@ -363,8 +589,74 @@ class CommentaryEngine:
           "finalize" — message just finalized, frontend should advance
                        startup ritual (if any) and start cooldown timer
           None       — nothing happened (idle or buffer empty)
+
+        Two skip paths run BEFORE we advance one char:
+          1. Memory markers ([REMEMBER:], [APP:], [FORGET:]) — jump past
+             the entire bracket block so the user never sees it.
+          2. Internal-narration preambles ("Got it! Let's update memory.
+             Now let's respond to the user: \"...\"") — jump past the
+             preamble so the visible stream starts at the actual reply.
+             Without this the user has to watch the model type its
+             planning thoughts before the real answer arrives.
         """
         if self.typed_chars < len(self.streaming_buffer):
+            buf = self.streaming_buffer
+            i = self.typed_chars
+
+            # ── Path 1: marker skip ──
+            # The display layer renders `buffer[:typed_chars]`, so
+            # advancing typed_chars past a marker is NOT enough — the
+            # marker text would still be in the rendered slice. We
+            # physically CUT the marker out of streaming_buffer when
+            # we recognize it, then stash the payload in
+            # `self._stream_markers` for memory-application at finalize.
+            #
+            # When we see `[`, hold the typewriter until we have enough
+            # chars to either confirm it's a marker (and then cut it)
+            # or rule one out (and then advance past `[`).
+            if buf[i] == "[":
+                MARKER_PREFIXES = ("[REMEMBER:", "[APP:", "[FORGET:")
+                MAX_PFX_LEN = max(len(p) for p in MARKER_PREFIXES)
+                have = buf[i:i + MAX_PFX_LEN].upper()
+                could_be = any(p.startswith(have) for p in MARKER_PREFIXES)
+                is_marker = any(have.startswith(p) for p in MARKER_PREFIXES)
+
+                if is_marker:
+                    end = buf.find("]", i)
+                    if end != -1:
+                        # Capture the marker payload before we cut.
+                        m = _MARKER_RE.match(buf, i)
+                        if m:
+                            self._stream_markers.append(
+                                (m.group(1).upper(), m.group(2).strip())
+                            )
+                        # Cut from buffer, including any trailing
+                        # whitespace/newlines so we don't leave a blank line.
+                        cut_to = end + 1
+                        while cut_to < len(buf) and buf[cut_to] in " \t\r\n":
+                            cut_to += 1
+                        self.streaming_buffer = buf[:i] + buf[cut_to:]
+                        # typed_chars stays at i — buffer[:i] was already
+                        # visible; what's at position i now is what came
+                        # after the marker.
+                        return "advanced"
+                    # Marker open but not yet closed — wait.
+                    return None
+
+                if could_be:
+                    # Not enough chars yet — wait rather than reveal `[`.
+                    return None
+
+                # Not a marker (e.g. literal `[note]` in prose). Advance.
+
+            # ── Path 2: internal-narration / wrapper preamble skip ──
+            # Same approach as markers: physically cut the preamble out
+            # of the buffer so it doesn't sit in `buffer[:typed_chars]`.
+            target = _find_skip_target(buf, i)
+            if target is not None and target > i:
+                self.streaming_buffer = buf[:i] + buf[target:]
+                return "advanced"
+
             self.typed_chars += 1
             return "advanced"
         if self.stream_complete and self.state != "IDLE":
@@ -384,7 +676,22 @@ class CommentaryEngine:
         self._cooldown_active = False
 
     def _finalize_message(self):
-        msg = self.streaming_buffer.strip()
+        # Markers found mid-stream were already cut from streaming_buffer
+        # and stashed in `self._stream_markers`. Run _extract_markers one
+        # more time in case any straggler arrived after the last typewriter
+        # tick (or the model broke its own marker syntax such that we
+        # didn't recognize it during streaming).
+        raw = self.streaming_buffer.strip()
+        msg, late_markers = _extract_markers(raw)
+        # Final cleanup: planning preamble the streaming filter didn't
+        # catch + strip wrapping quotes if the whole reply was quoted.
+        msg = _strip_wrappers(msg)
+        all_markers = list(self._stream_markers) + list(late_markers)
+        self._stream_markers = []
+        learn_summary = _apply_markers(self.memory, all_markers)
+        # Keep the variable name the rest of the function uses.
+        markers = all_markers
+
         if msg:
             ts = datetime.now().strftime("%H:%M:%S")
             self.history.append((ts, msg, "winston"))
@@ -396,10 +703,21 @@ class CommentaryEngine:
                     self.qa_history = self.qa_history[-5:]
                 self.pending_user_question = None
             elapsed = time.monotonic() - getattr(self, "_stream_started_at", time.monotonic())
-            _trace({"kind": "response",
-                    "trigger": getattr(self, "_current_path", None),
-                    "elapsed_sec": round(elapsed, 2),
-                    "text": msg})
+            trace_event = {
+                "kind": "response",
+                "trigger": getattr(self, "_current_path", None),
+                "elapsed_sec": round(elapsed, 2),
+                "text": msg,
+            }
+            # Only attach the learning audit when something was actually
+            # learned — keeps the reasoning log noise-free for routine
+            # commentary that didn't hit any markers.
+            if any(learn_summary.values()):
+                trace_event["learned"] = learn_summary
+                trace_event["markers"] = [
+                    {"kind": k, "payload": p} for k, p in markers
+                ]
+            _trace(trace_event)
         self.streaming_buffer = ""
         self.typed_chars = 0
         self.stream_complete = False

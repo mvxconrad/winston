@@ -536,14 +536,20 @@ class ProcessesView(QWidget):
 
     def refresh(self):
         from panels.base import fmt_bytes
+        from panels.processes import ProcessesPanel
 
         linux_procs = list(getattr(self.panel, "procs", []) or [])
         win_procs = list(getattr(self.panel, "win_procs", []) or [])
 
         # Merge: tag each row with origin, sort by CPU desc, cap at panel
         # limit so the table doesn't explode when a Windows game is running.
-        merged = [(cpu, mem, name, pid, "lin") for cpu, mem, name, pid in linux_procs]
-        merged += [(cpu, mem, name, pid, "win") for cpu, mem, name, pid in win_procs]
+        # Linux names get enriched at render-time only — CSV/memory keep
+        # raw process names, so "python3 (winston.py) [self]" never gets
+        # written down as a tracked app in memory.json.
+        merged = [(cpu, mem, ProcessesPanel.display_name(pid, name), pid, "lin")
+                  for cpu, mem, name, pid in linux_procs]
+        merged += [(cpu, mem, name, pid, "win")
+                   for cpu, mem, name, pid in win_procs]
         merged.sort(key=lambda r: -r[0])
         cap = max(getattr(self.panel, "limit", 14), 14)
         merged = merged[:cap]
@@ -978,31 +984,22 @@ class BrainView(QWidget):
                 f"<span style='color:{DIM};'>nothing fired yet</span>"
             )
 
-        # VAULT line: shows the markdown mirror of memory.json. Each page
-        # gets a quick "name (lines)" so you can see at a glance what
-        # Winston has written down without opening the files.
-        vault = getattr(bp, "_vault", {}) or {}
-        if vault.get("exists"):
-            pages = vault.get("pages", []) or []
-            kb = vault.get("total_bytes", 0) / 1024
-            page_strs = " · ".join(
-                f"<span style='color:{MEDIUM};'>{p['name']}</span>"
-                f"<span style='color:{DIM};'>:{p['lines']}</span>"
-                for p in pages
-            )
+        # MEMORY line: direct view of memory.json (no vault layer). Shows
+        # how many apps and free-form notes Winston has on file plus when
+        # memory was last refreshed from the CSV log.
+        if memory is not None:
+            apps_count = len(memory.facts.get("apps") or {})
+            notes_count = len(memory.facts.get("notes") or [])
+            last = memory.facts.get("last_learned")
+            short_last = last[11:19] if last and "T" in last else (last or "")
+            tail = (f"  <span style='color:{DIM};'>learned {short_last}</span>"
+                    if short_last else "")
             lines.append(
-                f"<span style='color:{DIM};'>VAULT </span>"
-                f"<span style='color:{DIM};'>{vault.get('path', 'vault')}/  "
-                f"({kb:.1f}KB)</span>"
-            )
-            if page_strs:
-                lines.append(
-                    f"<span style='color:{DIM};'>      </span>{page_strs}"
-                )
-        else:
-            lines.append(
-                f"<span style='color:{DIM};'>VAULT </span>"
-                f"<span style='color:{DIM};'>(not built yet)</span>"
+                f"<span style='color:{DIM};'>MEMORY </span>"
+                f"<span style='color:{MEDIUM};'>{apps_count} apps</span>"
+                f"<span style='color:{DIM};'> · </span>"
+                f"<span style='color:{MEDIUM};'>{notes_count} notes</span>"
+                f"{tail}"
             )
 
         self._label.setText(
@@ -1546,6 +1543,8 @@ class WinstonGui(QMainWindow):
         # Footer
         footer = QLabel(
             f"<span style='color:{BRIGHT}; font-weight:bold;'>Q</span>"
+            f"<span style='color:{DIM};'>/</span>"
+            f"<span style='color:{BRIGHT}; font-weight:bold;'>Ctrl+Q</span>"
             f" <span style='color:{DIM};'>quit</span> · "
             f"<span style='color:{BRIGHT}; font-weight:bold;'>R</span>"
             f" <span style='color:{DIM};'>reset</span> · "
@@ -1695,6 +1694,16 @@ class WinstonGui(QMainWindow):
                 pass
 
     def keyPressEvent(self, event):
+        # Global quit shortcut — handle BEFORE the ASK-focus early-return
+        # so Ctrl+Q works even while the user is typing in the input.
+        # Plain Q also still quits (handled below) but only outside ASK.
+        key = event.key()
+        mods = event.modifiers()
+        if (mods & Qt.KeyboardModifier.ControlModifier
+                and key == Qt.Key.Key_Q):
+            self.close()
+            return
+
         # When the ASK input has focus, hand all keys back to it so typing
         # works normally (otherwise pressing 'q' inside the input would
         # close the window).
@@ -1702,7 +1711,6 @@ class WinstonGui(QMainWindow):
             super().keyPressEvent(event)
             return
 
-        key = event.key()
         if event.text() == "/":
             self._ask.setFocus()
             return
@@ -1716,7 +1724,6 @@ class WinstonGui(QMainWindow):
         # Snap shortcuts — substitute for Windows Aero Snap, which WSLg
         # windows don't get because they're not "real" Windows apps from
         # the OS's point of view. Ctrl+↑/↓/←/→ as window-manager parity.
-        mods = event.modifiers()
         if mods & Qt.KeyboardModifier.ControlModifier:
             screen = self.screen() or QApplication.primaryScreen()
             geo = screen.availableGeometry()
