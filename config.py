@@ -77,19 +77,32 @@ LLM_MODEL = "qwen2.5:7b-instruct"
 # last quality-tier message.
 #
 # Set LLM_USE_TIERED to False to use LLM_MODEL for everything (simple mode).
-LLM_USE_TIERED = False
+LLM_USE_TIERED = True
 
-# Small/fast model. Stays resident in VRAM. Used for routine + heartbeats.
+# Small/fast model. Used for greeting, retrospective, heartbeat, routine,
+# and all triggered events. Loaded on demand and unloaded after each call
+# (see LLM_FAST_KEEP_ALIVE_SEC below) so VRAM is fully free between
+# commentaries.
 LLM_MODEL_FAST = "qwen2.5:3b-instruct"
 
-# Big/quality model. Unloads after LLM_QUALITY_KEEP_ALIVE_SEC of idle.
-# Used for alerts, user questions, greeting, retrospective.
+# Big/quality model. Used ONLY for user questions (the `/`-ask path).
 LLM_MODEL_QUALITY = "qwen2.5:7b-instruct"
 
-# How long Ollama keeps the QUALITY model loaded after its last use.
-# Lower = more aggressive VRAM freeing (paid for by 5-10s reload latency
-# on next quality-tier call). 300s is a comfortable default.
-LLM_QUALITY_KEEP_ALIVE_SEC = 300
+# How long Ollama keeps each model loaded after its last use.
+#
+# 0 = unload immediately after the answer finishes. Both models are
+# unloaded by default so the GPU is fully free between Winston's
+# commentaries — heartbeat fires once every 5 minutes, triggered events
+# even less often, so the cold-load cost is paid rarely. The 3B is small
+# (~2GB) and cold-loads in 1-3 seconds; the 7B is ~6GB and cold-loads in
+# 5-10 seconds. You'll see "thinking…" for that brief window each time
+# Winston has something to say.
+#
+# Bump either to 60-300 if you want quick follow-ups (model stays in
+# VRAM during that window after the last call) and don't mind the
+# memory sitting there idle.
+LLM_FAST_KEEP_ALIVE_SEC = 0
+LLM_QUALITY_KEEP_ALIVE_SEC = 0
 
 # DIAGNOSTIC FLAG — set False if you suspect the brain panel is causing
 # UI lag (e.g. dropped keystrokes in the ASK input). When False, the

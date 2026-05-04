@@ -148,17 +148,20 @@ on every chunk; combined with the markup-parse cost on each
       frame.
 - [ ] Verify with `top` that python3 stays <15% during streaming
 
-### Activate model tiering by default
-The scaffolding shipped in v0.8 (`LLM_USE_TIERED`, `LLM_MODEL_FAST`,
-`LLM_MODEL_QUALITY`, `LLM_QUALITY_KEEP_ALIVE_SEC`) currently defaults
-to `False` so behavior is identical to v0.7. Flip it on and verify.
+### Activate model tiering by default ✅
+Done in v0.8.1.
 
-- [ ] `LLM_USE_TIERED = True` as default in `config.py`
-- [ ] qwen2.5:3b-instruct for routine + heartbeat + triggered (notable)
-      → stays VRAM-resident, sub-second response
-- [ ] qwen2.5:7b-instruct for greeting + retrospective + alerts +
-      conversational → unloads after 5min idle so VRAM is free for
-      games. Re-load is ~5-10s on next quality call (acceptable).
+- [x] `LLM_USE_TIERED = True` as default
+- [x] qwen2.5:3b-instruct stays resident — handles greeting, retrospective,
+      heartbeat, routine, and all triggered events (including alerts).
+      Originally I had alerts using the 7B for nuance, but that pops the
+      7B into VRAM at the worst moment (something just went wrong → game
+      stutters → 7B loads). 3B's observation is plenty for thermal/RAM
+      alerts.
+- [x] qwen2.5:7b-instruct loads on-demand only for `/`-asked user
+      questions, with `LLM_QUALITY_KEEP_ALIVE_SEC=0` so it unloads the
+      moment the answer finishes. Trade: ~5-10s cold load every new
+      question. Worth it for keeping the GPU free during gaming.
 - [ ] BRAIN panel shows which model is actually loaded right now
       (already does — verify it updates correctly across tier switches)
 

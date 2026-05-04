@@ -130,15 +130,17 @@ class CommentaryPanel(Static):
         """Returns (model_name, keep_alive) for the given tier.
 
         tier: "fast" | "quality"
-        When LLM_USE_TIERED is False, both tiers fall back to single-model.
+        When LLM_USE_TIERED is False, both tiers fall back to single-model
+        with keep_alive=-1 (resident forever).
         """
         cfg = self._config
         if not cfg.get("use_tiered", False):
             return cfg.get("model"), -1
         if tier == "quality":
             return (cfg.get("model_quality") or cfg.get("model"),
-                    cfg.get("quality_keep_alive_sec", 300))
-        return (cfg.get("model_fast") or cfg.get("model"), -1)
+                    cfg.get("quality_keep_alive_sec", 0))
+        return (cfg.get("model_fast") or cfg.get("model"),
+                cfg.get("fast_keep_alive_sec", 0))
 
     # ──────────────── Lifecycle ────────────────
     def on_mount(self):
@@ -207,7 +209,11 @@ class CommentaryPanel(Static):
             return
 
         self._begin_streaming()
-        model, keep_alive = self._pick_model("quality")
+        # Greeting uses fast (3B) — same reasoning as triggered events.
+        # Quality (7B) is reserved for user questions only, where the user
+        # explicitly waited for an answer. Ambient ritual shouldn't pop the
+        # 7B into VRAM if the user is mid-game.
+        model, keep_alive = self._pick_model("fast")
         generate_stream_async(
             user, system=system, model=model, keep_alive=keep_alive,
             on_chunk=self._on_chunk_worker,
@@ -237,7 +243,9 @@ class CommentaryPanel(Static):
     def _begin_retrospective_call(self, system, user):
         from brain.client import generate_stream_async
         self._begin_streaming()
-        model, keep_alive = self._pick_model("quality")
+        # Retrospective uses fast (3B). Same reasoning as greeting — startup
+        # ritual shouldn't pop the 7B into VRAM during a gaming session.
+        model, keep_alive = self._pick_model("fast")
         generate_stream_async(
             user, system=system, model=model, keep_alive=keep_alive,
             on_chunk=self._on_chunk_worker,
@@ -355,9 +363,13 @@ class CommentaryPanel(Static):
                             datetime.now().strftime("%H:%M:%S"))
 
         self._begin_streaming()
-        # Alerts get the quality model; routine + notable use fast.
-        tier = "quality" if event.severity == "alert" else "fast"
-        model, keep_alive = self._pick_model(tier)
+        # All triggered events use the fast model. Alerts USED to use quality
+        # for nuance, but that pops the 7B back into VRAM at the worst possible
+        # moment (something just went wrong → GPU spike → game stutters → 7B
+        # loads). The 3B's observation is plenty for "GPU at 92°C" or "RAM
+        # nearly full." Quality stays reserved for greeting / retrospective /
+        # user-asked questions, where the user has time to wait.
+        model, keep_alive = self._pick_model("fast")
         generate_stream_async(
             user, system=system, model=model, keep_alive=keep_alive,
             on_chunk=self._on_chunk_worker,
@@ -1292,7 +1304,8 @@ def run(sections, logger, config=None):
         "use_tiered":              getattr(config, "LLM_USE_TIERED", False),
         "model_fast":              getattr(config, "LLM_MODEL_FAST", config.LLM_MODEL),
         "model_quality":           getattr(config, "LLM_MODEL_QUALITY", config.LLM_MODEL),
-        "quality_keep_alive_sec":  getattr(config, "LLM_QUALITY_KEEP_ALIVE_SEC", 300),
+        "fast_keep_alive_sec":     getattr(config, "LLM_FAST_KEEP_ALIVE_SEC", 0),
+        "quality_keep_alive_sec":  getattr(config, "LLM_QUALITY_KEEP_ALIVE_SEC", 0),
         "show_brain_panel":        getattr(config, "SHOW_BRAIN_PANEL", True),
         "user_name":               config.USER_NAME,
         "startup_greeting":        config.STARTUP_GREETING,
