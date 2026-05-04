@@ -1,7 +1,7 @@
 # Winston :: vault index
 
-> _Last updated: 2026-05-04T02:19:34_
-> _Last log learn: 2026-05-04T02:19:34_
+> _Last updated: 2026-05-04T02:28:20_
+> _Last log learn: 2026-05-04T02:28:20_
 
 This is Winston's persistent memory in markdown form. The canonical store
 is `logs/memory.json`; these pages are regenerated from it on every
@@ -20,4 +20,4 @@ is `logs/memory.json`; these pages are regenerated from it on every
 | User           | `max` |
 | Host           | `PC` |
 | Tracked apps   | `4` |
-| Last learned   | `2026-05-04T02:19:34` |
+| Last learned   | `2026-05-04T02:28:20` |

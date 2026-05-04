@@ -1,14 +1,11 @@
-# WINSTON
+<h1 align="center">W I N S T O N</h1>
 
-**W**ell-trained **I**ntuitive **N**eural **S**ystem **T**ranslating **O**bserved **N**umbers
+<p align="center">
+  <b>W</b>ell-trained &nbsp;·&nbsp; <b>I</b>ntuitive &nbsp;·&nbsp; <b>N</b>eural &nbsp;·&nbsp; <b>S</b>ystem &nbsp;·&nbsp;
+  <b>T</b>ranslating &nbsp;·&nbsp; <b>O</b>bserved &nbsp;·&nbsp; <b>N</b>umbers
+</p>
 
-A personal system monitor for the terminal. Watches CPU, RAM, GPU, disks, network, temperatures, and processes. Logs everything to CSV. A local LLM (Ollama) reads the panel state and produces dry, observant commentary — both on a heartbeat and event-driven when something noteworthy happens.
-
-![Winston at idle](docs/screenshot-idle.png)
-*Idle — Winston greeted, summarized the day, and is sitting quietly.*
-
-![Winston reacting to a load spike](docs/screenshot-active.png)
-*Triggered — `yes > /dev/null` on four cores. The `single_core_pegged` trigger fired.*
+A personal system monitor with a local-LLM butler. Watches CPU, RAM, GPU, disks, network, temperatures, and processes. Logs everything to CSV. Ollama reads the panel state and writes dry, observant commentary — both on a heartbeat and event-driven when something noteworthy happens. Two frontends share the same engine: a PyQt6 desktop app (`--gui`) and a Textual TUI (default).
 
 ## Quick links
 
@@ -23,18 +20,36 @@ A personal system monitor for the terminal. Watches CPU, RAM, GPU, disks, networ
 
 ## Stack
 
-[Textual](https://github.com/Textualize/textual), [Rich](https://github.com/Textualize/rich), [psutil](https://github.com/giampaolo/psutil), [pynvml](https://pypi.org/project/pynvml/) (optional), [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) (optional, for WSL temps), [Ollama](https://ollama.com) (optional, for commentary).
+[Textual](https://github.com/Textualize/textual) + [Rich](https://github.com/Textualize/rich) (TUI), [PyQt6](https://pypi.org/project/PyQt6/) + [pyqtgraph](https://pyqtgraph.org/) (GUI), [psutil](https://github.com/giampaolo/psutil), [pynvml](https://pypi.org/project/pynvml/) (optional), [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) (optional, for WSL temps), [Ollama](https://ollama.com) (optional, for commentary).
+
+## GUI (desktop)
+
+`python winston.py --gui` — native PyQt6 window, GPU-accelerated charts via pyqtgraph, scrollable, smooth at 60 fps even while gaming.
+
+![Winston GUI](docs/winston_gui_v1.png)
+*Same panels as the TUI plus the BRAIN view (state · model · top apps · vault).*
+
+## CLI (TUI)
+
+`python winston.py` — runs in any terminal, hand-rolled braille graphs, full keyboard control.
+
+![Winston at idle](docs/screenshot-idle.png)
+*Idle — greeted, summarized the day, sitting quietly.*
+
+![Winston reacting to a load spike](docs/screenshot-active.png)
+*Triggered — `yes > /dev/null` on four cores. The `single_core_pegged` trigger fired.*
 
 ## Run
 
 ```bash
-pip install textual psutil pynvml
-ollama pull qwen2.5:3b-instruct           # resident model
+pip install textual psutil pynvml PyQt6 pyqtgraph
+ollama pull qwen2.5:3b-instruct           # routine commentary
 ollama pull qwen2.5:7b-instruct           # loaded on demand for /-asked questions
-python winston.py
+python winston.py                          # TUI (default)
+python winston.py --gui                    # PyQt6 desktop app
 ```
 
-`Q` quit · `R` reset graphs · `/` focus the ASK input.
+`Q` quit · `R` reset graphs · `/` focus the ASK input. GUI also has `F11` fullscreen and `Ctrl+↑/↓/←/→` snap.
 
 All tunables live in `config.py` (refresh rates, LLM behavior, trigger thresholds). `winston.py` is just imports + the section list.
 
@@ -50,9 +65,9 @@ All tunables live in `config.py` (refresh rates, LLM behavior, trigger threshold
 | **TEMPS** | 1 Hz | One row per device category — best representative sensor each, BIOS trip-points and firmware placeholders filtered. |
 | **GPU** | 2 Hz | Util + power inline, VRAM + size inline, CORE/HOTSPOT/VRAM temps inline. |
 | **NETWORK** | renders 2 Hz, host source polled **every 5 s** | Windows host stats via PowerShell (sees Chrome traffic). 5 s is intentional — see [the investigation](#investigation-networkpanel-and-dropped-keystrokes) below. |
-| **PROCESSES** | 1 Hz | Top 8 by CPU. Same heatmap palette as everywhere else. |
+| **PROCESSES** | 1 Hz | Top 14 by CPU, merged from psutil (Linux/WSL) + PowerShell `Get-Process` (Windows host, daemon-cached every 5 s). Windows rows tagged `[win]`. |
 | **COMMENTARY** | event-driven | LLM-generated; see next section. |
-| **BRAIN** | 1 Hz, dirty-checked | Winston's internal state. Toggleable via `SHOW_BRAIN_PANEL`. |
+| **BRAIN** | 1 Hz, dirty-checked | Winston's internal state — current model, top apps from memory, last trigger fired, MD vault summary. Toggleable via `SHOW_BRAIN_PANEL`. |
 
 ## Commentary, memory, and tiered LLM
 
@@ -75,9 +90,11 @@ Both models default to `keep_alive=0` — they load on demand, generate the answ
 
 You'll see "thinking…" for that brief window each time Winston has something to say. Bump `LLM_FAST_KEEP_ALIVE_SEC` or `LLM_QUALITY_KEEP_ALIVE_SEC` in `config.py` (e.g. to 60-300) if you want quick follow-ups at the cost of VRAM idle.
 
-### Persistent memory
+### Persistent memory + MD vault
 
-`brain/memory.py` keeps a JSON file at `logs/memory.json` (gitignored) — top apps from log scan, behavioral fingerprints (avg CPU/GPU when each app is top-1), machine facts (CPU, GPU, RAM). Threaded into every prompt builder so commentary is personalized. Surviving a model unload doesn't lose anything: Winston's memory is plain Python state, independent of which model is loaded.
+`brain/memory.py` keeps a JSON file at `logs/memory.json` (gitignored) — top apps from log scan, behavioral fingerprints (avg CPU/GPU when each app is top-1), machine facts (CPU, GPU, RAM). Threaded into every prompt builder so commentary is personalized.
+
+On every save the same facts are mirrored to `vault/{index,user,machine,apps}.md` — a human-readable markdown vault you can open in Obsidian, Logseq, or `cat`. JSON is canonical; the vault is derived. The BRAIN panel shows the vault path + page count so it stays discoverable.
 
 ## Architecture
 
@@ -212,6 +229,7 @@ brain/                  # LLM layer — SHARED across frontends
   triggers.py           # the 7 trigger functions + TriggerRunner
   history.py            # single-pass O(n) CSV scanner
   memory.py             # persistent JSON-backed user memory
+  vault.py              # MD mirror of memory.json — vault/*.md regenerated on save
   commentary_engine.py  # backend-agnostic orchestrator — state machine,
                         # trigger evaluation, heartbeat, stale-quiet,
                         # Q&A history. Both frontends consume this.
@@ -223,9 +241,14 @@ cli/                    # TUI frontend — only renders engine state
 gui/                    # desktop frontend — only renders engine state
   main.py               # PyQt6 + pyqtgraph; QMainWindow + view widgets
 
-logs/
-  raw/observations.csv  # 1 row/sec — gitignored
-  memory.json           # Winston's persistent memory — gitignored
+logs/                   # gitignored
+  raw/observations.csv  # 1 row/sec time-series CSV
+  memory.json           # canonical persistent memory
+  reasoning.jsonl       # every prompt + response (canonical, machine-parseable)
+  reasoning.log         # same events, human-readable mirror
+
+vault/                  # gitignored — markdown mirror of memory.json
+  index.md · user.md · machine.md · apps.md
 ```
 
 **Adding a panel:** drop a class in `panels/` with `update()`, `render(width=None)`, `csv_headers()`, `csv_columns()`. Add it to the section list in `winston.py` and a layout slot in BOTH `cli/display.py` (`compose()`) and `gui/main.py` (`WinstonGui.__init__` row layout). The data class is shared.
