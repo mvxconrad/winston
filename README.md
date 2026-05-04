@@ -61,32 +61,124 @@ Util bar with `25W of 220W` power draw inline. VRAM bar with `2.1GB of 12.0GB` s
 
 GPU name strips redundant prefixes when space is tight: "NVIDIA GeForce RTX 4070 SUPER" → "RTX 4070 SUPER".
 
-### NETWORK (2Hz)
+### NETWORK (panel renders at 2Hz, host source polled every 5s)
 On WSL, defaults to **Windows host stats** via PowerShell `Get-NetAdapterStatistics`. WSL2's virtual interfaces only see traffic launched from inside WSL — Chrome, games, and most desktop apps run on Windows and never touch the WSL counters. Querying the host gives the real numbers.
 
-The PowerShell call is ~50ms. Doing it synchronously at 2Hz blocked the UI noticeably, so it runs on a background thread and the panel reads cached values.
+PowerShell polling runs on a background thread (`winston-net-poller`) — never on the UI thread. **Polling interval is 5 seconds**, not faster, because each poll spawns a fresh PowerShell process across the WSL→Windows boundary (50-200ms each). Even on a daemon thread, faster polling caused visible input drops in the ASK box — see the *NetworkPanel and dropped keystrokes* note in [Architecture notes](#architecture-notes) for the full story.
 
 Rates are smoothed over a 2-second rolling window to avoid spikes/zeros from uneven tick spacing. Peak download/upload rates are tracked persistently — on init, the panel scans `logs/raw/observations.csv` (single-pass O(n) max) to find the highest historical rates and seeds the graph scale with those. Graphs scale to observed peaks, so a speedtest fills the bars dramatically while routine YouTube traffic shows as a small fraction. The peak only ever grows.
 
 ### PROCESSES (1Hz)
 Top 8 by CPU. CPU% column uses the same heatmap palette as everything else, so a process at 50% looks visually consistent with a CPU panel at 50%.
 
-### COMMENTARY (placeholder)
-Currently cycles through hardcoded status messages. This is where Stage 5 (LLM commentary) will plug in.
+### COMMENTARY (event-driven, plus heartbeat + startup ritual)
+A local Ollama LLM (default `qwen2.5:7b-instruct`) reads the panel state and produces dry, observant commentary. Three trigger paths:
+
+1. **Startup ritual** — time-aware greeting (`Good morning, max.` / `Up late tonight, max?`) followed by a one-line retrospective summarizing the last 24h of logs.
+2. **Event-driven** — `brain/triggers.py` evaluates per-second triggers (single core pegged, sustained CPU, thermal alerts, memory pressure, network burst, new heavy process). When one fires, Winston comments on the specific event with severity-aware tone.
+3. **Heartbeat** — every `HEARTBEAT_INTERVAL_SEC` (default 5min) a routine "all good / here's the state" comment fires so Winston isn't silent during quiet periods.
+
+Output streams token-by-token into the panel via a typewriter buffer that decouples LLM generation rate (~80 tok/s) from display rate (configurable, default 25 tps) — feels deliberate rather than blasted onto the screen. Press `/` to focus the ASK input below the panel and ask a question; the answer streams in and preempts whatever was streaming. Last 3 Q&A pairs are kept as multi-turn context.
+
+The panel renders a fading-color chat log (newest message bright green, older lines fade through medium → dim → grey). Cursor blinks during THINKING/STREAMING states.
+
+### BRAIN (1Hz, dirty-checked)
+Winston's internal state, not the machine's: which model is loaded, the LLM client's current state (THINKING / STREAMING / IDLE / ERROR), what Winston knows about you (top apps from log scan with mini GPU-load bars), and the last trigger event that fired. Updates at 1Hz with a dirty-check skip — when nothing's changed, the tick is a near no-op and never re-renders.
+
+Disabled with `SHOW_BRAIN_PANEL = False` in `config.py` if you want a tighter layout.
 
 ## Architecture notes
 
-### Refresh rate decoupling
-Each panel updates at its own rate (constants at the top of `winston.py`). The display layer schedules per-panel intervals — no master tick that everyone hangs off. Logger ticks independently at 1Hz so the CSV is always evenly spaced regardless of how fast individual panels update.
+### Master frame loop (30 FPS)
+The whole dashboard refreshes on a single clock — `FRAME_HZ = 30` in `config.py`. One `set_interval` in `display.py:WinstonApp.on_mount` drives `_frame_tick`, which checks each panel's per-panel rate and only fires `panel.update()` when the interval has elapsed. Widget refreshes are batched per frame so Textual's compositor sees one coherent dirty pass instead of many uncoordinated ones.
+
+This is what btop/k9s/htop do, and it matters for two reasons:
+
+1. **Visual consistency** — every visible refresh lands on the same 33ms grid, so panels don't jitter against each other's cadences.
+2. **Input responsiveness** — fewer competing timers means the asyncio loop is free to read keystrokes between frames. With 14 separate `set_interval` calls (the previous design), the compositor was getting refresh requests at uncoordinated moments and stdin processing got starved.
+
+Per-panel `*_HZ` constants in `config.py` still control how often each panel re-fetches data — they just gate when `update()` runs *within* the frame loop instead of being independent timers.
+
+### The 5ms rule: heavy work goes on a thread
+**Anything that takes more than ~5ms must run on a daemon thread, not the UI thread.** The UI panel just reads from a thread-safe cache. This is how btop adds 30 panels without lagging.
+
+Currently on background threads:
+
+| Thread | Module | Why |
+| --- | --- | --- |
+| `winston-lhm-poller` | `panels/lhm.py` | LHM HTTP fetch (~10-50ms) — both GPU and Temps panels read its cache |
+| `winston-net-poller` | `panels/network.py` | PowerShell `Get-NetAdapterStatistics` (~50ms) |
+| `winston-gpu-poller` | `panels/gpu.py` | pynvml / nvidia-smi calls into the WSL→Windows driver bridge (11-40ms spikes) |
+| `winston-llm-worker` | `brain/client.py` | Ollama HTTP streaming — sub-second to several seconds per call |
+
+`panel.update()` on the UI thread is then a sub-millisecond cache copy.
+
+When adding a new feature: if it makes a syscall, an HTTP call, a subprocess call, or anything else that could exceed ~5ms — put it on a thread. Don't pollute the UI thread.
+
+### LLM calls are FIFO, single-flight
+`brain/client.py` runs **one** worker thread (`winston-llm-worker`) with a `queue.Queue` of jobs. All LLM calls — greeting, retrospective, triggered commentary, conversational answers — go through this queue. Two reasons:
+
+1. **The UI thread never blocks on Ollama.** Calls can take seconds; the worker thread eats that latency, the UI thread keeps painting and reading input.
+2. **Running multiple Ollama calls in parallel would just thrash a single GPU.** Two requests don't get answered twice as fast — they slow each other down. FIFO matches user expectations: "answer my question, *then* the next periodic update."
+
+### Lazy stream timers in CommentaryPanel
+The typewriter (25 Hz) and cursor blink (2.5 Hz) timers are only started in `_begin_streaming()` and stopped in `_finalize_message()` / `_on_error()`. While Winston is idle (no LLM call in flight), neither timer is scheduled — keeps the asyncio loop quiet between messages.
 
 ### Theme is a single source of truth
 All color decisions live in `theme.py`. Panels never define colors locally — they import `heat_pct(percent)` and `heat_temp(celsius)` which return colors from a 7-stop palette. Switching the entire app's color scheme is a one-file edit.
 
-### Background polling threads
-Anything that takes more than a few ms (PowerShell calls, HTTP fetches) runs on a daemon thread, not the UI thread. The shared LHM poller (`panels/lhm.py`) fetches once and both the GPU and Temps panels read from the same cache — no duplicate HTTP requests.
-
 ### Bytes formatting
 `fmt_bytes()` returns `KB / MB / GB / TB / PB` (powers of 1024 with conventional suffixes). Same as htop, btop, and Windows File Explorer.
+
+### NetworkPanel and dropped keystrokes — the story behind the 5s poll
+This one took a while to find, so it's worth writing down.
+
+Symptom: typing into the ASK input dropped roughly 1 in 20 characters. Felt like network lag in a remote terminal but it was happening locally. Worse on long sentences, fine on short bursts.
+
+What we ruled out (each tested in isolation):
+- Textual version (8.2.5)
+- Terminal/WSL itself (typing in plain bash was fine)
+- Per-chunk LLM streaming repaints
+- The brain panel (`SHOW_BRAIN_PANEL=False` — still dropped)
+- Heavy panel render rates
+- Synchronous CSV writes
+- `psutil.process_iter` on the UI thread
+- Eight progressively-loaded test apps that mimicked Winston's tick pattern (CPU sampling, Rich rendering, braille graphs, real `psutil` calls). All passed.
+
+What the timing log eventually showed: nothing. Every individual UI-thread tick was under 10ms. Total UI-thread work was ~36ms/sec — only 3.6% utilization. The asyncio loop had plenty of headroom. So the culprit wasn't on the UI thread.
+
+What it actually was: `panels/network.py` polls `Get-NetAdapterStatistics` via PowerShell on a daemon thread. The original interval was 0.5s (2Hz). Every poll spawns a fresh PowerShell process across the WSL→Windows boundary — 50-200ms of process creation per call. Even though `subprocess.run()` releases the GIL during the wait, the GIL handoffs around subprocess return + `text=True` decoding repeatedly poked the asyncio loop, and stdin reading occasionally lost a character to the noise.
+
+We confirmed this with two env vars:
+- `WINSTON_NO_NET=1` (network thread off, everything else on) → typing perfect
+- `WINSTON_NO_LHM=1` (LHM thread off, network on) → typing still dropped
+
+So: NetworkPanel's PowerShell loop was the only culprit. LHM JSON parsing on its thread (`panels/lhm.py`) wasn't enough to disrupt input, because that work is local — `urllib` releases the GIL cleanly during HTTP, and `json.loads` on ~10KB takes ~1-3ms. GPU's pynvml calls go through `ctypes` which also releases the GIL cleanly during the local `libnvidia-ml.so` calls. **What makes the network case bad is specifically that PowerShell-on-WSL spawns a Windows process every poll.**
+
+Fix:
+- Bumped `POLL_INTERVAL_SEC` from 0.5s to 5s in `panels/network.py`.
+- Tested 0.5s / 2s / 5s — 0.5s dropped 1 in 20, 2s dropped occasional letters, 5s clean.
+- Network rates feel less live but typing is solid; you still see speedtest-scale bursts in the graph because the peak tracking is persistent.
+
+Proper future fix (not done yet): keep a long-lived PowerShell session and pipe `Get-NetAdapterStatistics` queries to its stdin. Eliminates per-call process churn so polling can go back to 1-2Hz without input cost. ~30 line change.
+
+### Diagnostic env vars
+For chasing future UI lag or input drops:
+
+```bash
+# Bisect background-thread GIL contention:
+WINSTON_NO_THREADS=1 python3 winston.py    # both NetworkPanel and LHM threads off
+WINSTON_NO_NET=1 python3 winston.py        # only NetworkPanel thread off
+WINSTON_NO_LHM=1 python3 winston.py        # only LHM thread off
+
+# Bisect UI-thread panel updates:
+WINSTON_DISABLE_PANELS=GpuPanel,StatusBar python3 winston.py
+
+# Catch slow ticks:
+WINSTON_TIMING=1 WINSTON_TIMING_MS=5 python3 winston.py    # logs to /tmp/winston_timing.log
+```
+
+`WINSTON_DISABLE_PANELS` skips the named panels' ticks entirely (the panels still draw their primed values, they just don't refresh). `WINSTON_TIMING` writes a row to `/tmp/winston_timing.log` whenever a UI-thread tick exceeds the threshold (default 10ms, settable via `WINSTON_TIMING_MS`).
 
 ## Temperatures on WSL
 
@@ -128,10 +220,12 @@ The active backend is shown at the top of the TEMPS panel (`via LHM`, `via WMI`,
 ## Project layout
 
 ```
-winston.py              # entry point — refresh-rate constants, section list
-display.py              # Textual app, custom chrome, layout CSS, CpuGraphWidget
+winston.py              # entry point — imports, section list, run() call (small + structural)
+config.py               # all tunable behavior — refresh rates, LLM/trigger thresholds, FRAME_HZ
+display.py              # Textual app, custom chrome, layout CSS, master frame loop, CpuGraphWidget
 theme.py                # all color decisions; heat_pct() / heat_temp() helpers
 logger.py               # CSV writer
+input_test.py           # standalone Textual test app — bisect harness for input-drop debugging
 panels/
   __init__.py
   base.py               # bar gauges, braille graph, fmt_bytes
@@ -141,18 +235,30 @@ panels/
   system.py             # load avg, procs, threads, swap, I/O, uptime
   disk.py               # Windows + Linux mount listing
   temps.py              # multi-backend (native / LHM / WMI), smart device labels
-  gpu.py                # pynvml or nvidia-smi + LHM enrichment
-  network.py            # PowerShell host stats on WSL, smoothed rates, peak tracking
+  gpu.py                # pynvml or nvidia-smi + LHM enrichment, polled on its own thread
+  network.py            # PowerShell host stats on WSL (5s poll), smoothed rates, peak tracking
   processes.py          # top N by CPU
   lhm.py                # shared LHM HTTP poller (background thread, single cache)
+  brain.py              # BRAIN panel — visualizes Winston's internal LLM state
+brain/
+  __init__.py
+  client.py             # Ollama client — sync, async, streaming; FIFO worker thread
+  prompt.py             # observation/greeting/retrospective/triggered/conversational builders
+  baselines.py          # rolling mean/stddev for per-metric anomaly detection
+  triggers.py           # event-driven commentary — fires when conditions are met
+  history.py            # single-pass O(n) CSV scanner for log retrospectives
+  memory.py             # persistent JSON-backed memory of the user (most-used apps, machine facts)
+ui/
+  ask.py                # (legacy modal popup; not currently wired)
 logs/
   raw/
     observations.csv    # 1 row/sec, all panel data — gitignored
-diag_lhm.py             # standalone connectivity diagnostic for LHM/WSL setup
-perf_diag.py            # times each panel's update/render to find slowness
+  memory.json           # Winston's persistent memory of the user — gitignored
 ```
 
 Adding a new panel: drop a class in `panels/` with `update()`, `render(width=None)`, `csv_headers()`, `csv_columns()` methods. Optional `title` property for dynamic panel titles. Add it to the section list in `winston.py` with its refresh rate, and add a layout slot in `display.py`.
+
+Adding anything that does I/O, subprocess, or syscalls: put the slow work on a daemon thread and have `update()` read from a lock-guarded cache. See [The 5ms rule](#the-5ms-rule-heavy-work-goes-on-a-thread) above.
 
 ## Logging
 

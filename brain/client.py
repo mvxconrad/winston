@@ -25,6 +25,7 @@ import json
 import os
 import platform
 import queue
+import re
 import threading
 import time
 import urllib.error
@@ -39,6 +40,43 @@ OLLAMA_PORT = 11434
 
 # Cap how long any single generation can take. After this we give up.
 HTTP_TIMEOUT_SEC = 60.0
+
+
+# ──────────────── Output sanitization ────────────────
+# qwen2.5 is multilingual and occasionally code-switches into Chinese
+# (or other scripts) mid-response. We strip anything outside the Latin
+# range so output stays consistently English-readable.
+#
+# Allowed: ASCII printables + Latin-1 + Latin Extended-A/B/Additional
+# (covers café, naïve, etc.), plus a curated list of common typographic
+# punctuation the model emits (em/en dashes, curly quotes, ellipsis).
+# Blocked: CJK, Cyrillic, Arabic, Devanagari, etc.
+#
+# Whitespace (\s) explicitly allowed because \s includes \n, \r, \t which
+# the regex's [printable] range does NOT — important for streaming chunks
+# that are pure whitespace.
+_ALLOWED_PUNCT = "—–‘’“”…•·"
+_SAFE_TEXT_RE = re.compile(
+    r"[^"
+    r"\x20-\x7E"          # ASCII printable
+    r"\u00A0-\u024F"      # Latin-1 Supplement, Latin Extended-A/B
+    r"\u1E00-\u1EFF"      # Latin Extended Additional
+    + _ALLOWED_PUNCT +    # explicit punctuation we want to keep
+    r"\s"                 # whitespace (tabs, newlines)
+    r"]+"
+)
+
+
+def sanitize_chunk(text):
+    """Strip non-Latin characters from a streaming chunk.
+
+    Returns the cleaned string. Pure-whitespace chunks pass through
+    unchanged. We replace stripped runs with empty string rather than
+    a placeholder so the user never sees evidence the model misbehaved.
+    """
+    if not text:
+        return text
+    return _SAFE_TEXT_RE.sub("", text)
 
 
 def _is_wsl():
@@ -91,17 +129,24 @@ _url = f"http://{_host}:{OLLAMA_PORT}/api/generate"
 
 
 # ──────────────── Sync API ────────────────
-def generate(prompt, system=None, model=DEFAULT_MODEL, timeout=HTTP_TIMEOUT_SEC):
+def generate(prompt, system=None, model=DEFAULT_MODEL, timeout=HTTP_TIMEOUT_SEC,
+             keep_alive=-1):
     """Synchronous LLM call. Returns the generated text, or None on error.
 
     Don't call from the UI thread — this BLOCKS for up to 60 seconds.
     Use generate_async() instead from any code path that needs to render.
+
+    keep_alive: how long Ollama should keep the model in VRAM after this
+                call. -1 = forever (default; subsequent calls stay fast).
+                A number = seconds. 0 = unload immediately. Use a positive
+                value for "quality" models you only call occasionally so
+                they free VRAM during games.
     """
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "keep_alive": -1,  # never unload — keeps subsequent calls fast
+        "keep_alive": keep_alive,
     }
     if system:
         payload["system"] = system
@@ -116,7 +161,10 @@ def generate(prompt, system=None, model=DEFAULT_MODEL, timeout=HTTP_TIMEOUT_SEC)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             data = json.loads(r.read().decode("utf-8"))
-            return data.get("response", "").strip() or None
+            response = data.get("response", "").strip() or None
+            if response is not None:
+                response = sanitize_chunk(response)
+            return response or None
     except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
         return None
     except Exception:
@@ -125,13 +173,16 @@ def generate(prompt, system=None, model=DEFAULT_MODEL, timeout=HTTP_TIMEOUT_SEC)
 
 
 # ──────────────── Streaming API ────────────────
-def generate_stream(prompt, system=None, model=DEFAULT_MODEL, timeout=HTTP_TIMEOUT_SEC):
+def generate_stream(prompt, system=None, model=DEFAULT_MODEL,
+                    timeout=HTTP_TIMEOUT_SEC, keep_alive=-1):
     """Yields text chunks as the model generates them. Generator function.
 
     Ollama returns newline-delimited JSON when stream=True. Each line is a
     JSON object with a `response` field containing the next chunk (usually
     a token or two). We yield each chunk as it arrives, so the caller can
     update a UI in real-time.
+
+    keep_alive: see generate(). Default -1 (resident forever).
 
     Yields strings (chunks). Returns nothing — caller accumulates if needed.
 
@@ -142,7 +193,7 @@ def generate_stream(prompt, system=None, model=DEFAULT_MODEL, timeout=HTTP_TIMEO
         "model": model,
         "prompt": prompt,
         "stream": True,
-        "keep_alive": -1,
+        "keep_alive": keep_alive,
     }
     if system:
         payload["system"] = system
@@ -167,7 +218,12 @@ def generate_stream(prompt, system=None, model=DEFAULT_MODEL, timeout=HTTP_TIMEO
                     continue
                 chunk = obj.get("response", "")
                 if chunk:
-                    yield chunk
+                    # Strip non-Latin characters before yielding. Done at
+                    # the lowest level so EVERY consumer (commentary,
+                    # retrospective, conversational, etc.) gets clean text.
+                    cleaned = sanitize_chunk(chunk)
+                    if cleaned:
+                        yield cleaned
                 if obj.get("done"):
                     return
     except (urllib.error.URLError, OSError, TimeoutError):
@@ -178,7 +234,7 @@ def generate_stream(prompt, system=None, model=DEFAULT_MODEL, timeout=HTTP_TIMEO
 
 # ──────────────── Async Streaming API ────────────────
 def generate_stream_async(prompt, on_chunk, on_done=None, on_error=None,
-                          system=None, model=DEFAULT_MODEL):
+                          system=None, model=DEFAULT_MODEL, keep_alive=-1):
     """Stream tokens to a callback on a background worker thread.
 
     Callbacks (called from the WORKER thread, not the UI thread):
@@ -188,11 +244,16 @@ def generate_stream_async(prompt, on_chunk, on_done=None, on_error=None,
       on_error()       — called if the stream failed before completion.
                          Optional.
 
+    keep_alive: see generate(). Pass a positive number of seconds to make
+                Ollama unload the model after that idle window — useful
+                for the "quality" big model when you don't want it eating
+                VRAM during games.
+
     Note: callbacks fire on the worker thread. Textual's `call_from_thread`
     is the right way to marshal back to the UI thread inside the callback.
     """
     _ensure_worker()
-    _job_queue.put(("stream", prompt, system, model,
+    _job_queue.put(("stream", prompt, system, model, keep_alive,
                     on_chunk, on_done, on_error))
 
 
@@ -213,14 +274,17 @@ def _worker_loop():
             return
 
         # Two job shapes:
-        #   ("stream", prompt, system, model, on_chunk, on_done, on_error)
-        #   (prompt, system, model, callback)  — non-streaming
+        #   ("stream", prompt, system, model, keep_alive,
+        #              on_chunk, on_done, on_error)
+        #   (prompt, system, model, keep_alive, callback)  — non-streaming
         if isinstance(job, tuple) and job[0] == "stream":
-            _, prompt, system, model, on_chunk, on_done, on_error = job
+            (_, prompt, system, model, keep_alive,
+             on_chunk, on_done, on_error) = job
             chunks = []
             had_error = False
             try:
-                for chunk in generate_stream(prompt, system=system, model=model):
+                for chunk in generate_stream(prompt, system=system, model=model,
+                                             keep_alive=keep_alive):
                     chunks.append(chunk)
                     try:
                         on_chunk(chunk)
@@ -244,10 +308,11 @@ def _worker_loop():
             except Exception:
                 pass
         else:
-            # Non-streaming job: (prompt, system, model, callback)
-            prompt, system, model, callback = job
+            # Non-streaming job: (prompt, system, model, keep_alive, callback)
+            prompt, system, model, keep_alive, callback = job
             try:
-                result = generate(prompt, system=system, model=model)
+                result = generate(prompt, system=system, model=model,
+                                  keep_alive=keep_alive)
             except Exception:
                 result = None
             try:
@@ -271,7 +336,8 @@ def _ensure_worker():
         _worker_thread.start()
 
 
-def generate_async(prompt, on_done, system=None, model=DEFAULT_MODEL):
+def generate_async(prompt, on_done, system=None, model=DEFAULT_MODEL,
+                   keep_alive=-1):
     """Queue a generation job. on_done(text_or_None) is called when finished.
 
     Safe to call from the UI thread. Multiple calls are FIFO-queued — they
@@ -279,7 +345,7 @@ def generate_async(prompt, on_done, system=None, model=DEFAULT_MODEL):
     just slows both down).
     """
     _ensure_worker()
-    _job_queue.put((prompt, system, model, on_done))
+    _job_queue.put((prompt, system, model, keep_alive, on_done))
 
 
 def queue_depth():

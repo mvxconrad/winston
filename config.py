@@ -29,6 +29,13 @@ this is the file.
 #   0.5+  — rarely-changing structural data (load avg, system info)
 #   0.1   — practically static data (disk usage)
 
+# Master frame rate. The whole dashboard refreshes on this single clock so
+# panel updates land in the same paint pass — no visual jitter from panels
+# on different cadences. Per-panel hz settings below still control how often
+# each panel re-fetches its DATA; the frame rate just sets when the screen
+# is repainted. 30 is comfortable; 60 is silky if your CPU has the headroom.
+FRAME_HZ       = 30.0
+
 CPU_GRAPH_HZ   = 4.0
 CPU_CORES_HZ   = 4.0
 RAM_HZ         = 2.0
@@ -58,6 +65,37 @@ USER_NAME = "max"
 # Recommended: qwen2.5:7b-instruct (smart + fast, ~5GB VRAM)
 # Alternatives: llama3.1:8b, qwen2.5:3b (faster, lower VRAM, less nuanced)
 LLM_MODEL = "qwen2.5:7b-instruct"
+
+# ─── Model tiering (free up VRAM during games) ────────────────
+# Two-tier model strategy: a SMALL model for the boring 90% case (routine
+# heartbeats, trigger commentary), a BIGGER QUALITY model for moments
+# where it matters (alerts, conversational questions, startup ritual).
+#
+# The fast model stays VRAM-resident (keep_alive=-1, sub-second responses).
+# The quality model uses a positive keep_alive, so Ollama unloads it after
+# that idle window — your GPU is free for games again 5min after Winston's
+# last quality-tier message.
+#
+# Set LLM_USE_TIERED to False to use LLM_MODEL for everything (simple mode).
+LLM_USE_TIERED = False
+
+# Small/fast model. Stays resident in VRAM. Used for routine + heartbeats.
+LLM_MODEL_FAST = "qwen2.5:3b-instruct"
+
+# Big/quality model. Unloads after LLM_QUALITY_KEEP_ALIVE_SEC of idle.
+# Used for alerts, user questions, greeting, retrospective.
+LLM_MODEL_QUALITY = "qwen2.5:7b-instruct"
+
+# How long Ollama keeps the QUALITY model loaded after its last use.
+# Lower = more aggressive VRAM freeing (paid for by 5-10s reload latency
+# on next quality-tier call). 300s is a comfortable default.
+LLM_QUALITY_KEEP_ALIVE_SEC = 300
+
+# DIAGNOSTIC FLAG — set False if you suspect the brain panel is causing
+# UI lag (e.g. dropped keystrokes in the ASK input). When False, the
+# brain panel widget isn't created and its 1Hz tick doesn't run. Memory
+# + personalization still work fully; you just don't see the BRAIN panel.
+SHOW_BRAIN_PANEL = True
 
 # Whether to do the startup ritual on launch:
 #   1. Greeting (time-aware: "Good morning, max." / "Good evening, max." /

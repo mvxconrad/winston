@@ -114,7 +114,15 @@ def _poll_loop():
 
 
 def _ensure_started():
-    """Start the polling thread on first call. Idempotent."""
+    """Start the polling thread on first call. Idempotent.
+
+    WINSTON_NO_THREADS=1 or WINSTON_NO_LHM=1 disables it — kept for
+    diagnosing input-drop issues. With no LHM thread, GPU hot-spot /
+    memory-junction temps and the multi-device TEMPS panel will be empty,
+    but the dashboard is otherwise unaffected.
+    """
+    if os.environ.get("WINSTON_NO_THREADS") or os.environ.get("WINSTON_NO_LHM"):
+        return
     global _thread
     with _lock:
         if _thread is not None and _thread.is_alive():

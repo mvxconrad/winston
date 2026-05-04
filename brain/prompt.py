@@ -22,10 +22,16 @@ top processes. Your job is to comment on what's noteworthy in ONE OR TWO \
 SHORT SENTENCES. Be observant and a little dry. Don't restate every \
 metric — pick what matters.
 
+If a "WHAT YOU KNOW" block is included, use it to make smart, personal \
+inferences. Example: if the user's most-played app is running and the GPU \
+is hot, you can say "GPU running hot — looks like an Ark session." Don't \
+shoehorn personalization in when nothing connects; only use it when it \
+genuinely fits the moment.
+
 Examples of good output:
 - "Idle. CPU barely doing anything, GPU completely cold."
 - "Chrome's eating 4GB. That's a lot of tabs."
-- "GPU at 78°C — running hot. Probably a game."
+- "GPU at 78°C — running hot. Probably an Ark session."
 - "Network's busy: 350 Mbps down. Big download somewhere."
 
 Rules:
@@ -33,6 +39,7 @@ Rules:
 - No preamble like "Looking at the data..." — just the observation.
 - Don't list metrics back; assume the user can see the screen.
 - If everything looks normal, say so briefly. Don't invent drama.
+- Always respond in English.
 """
 
 
@@ -40,6 +47,58 @@ Rules:
 # Each function takes a panel object, returns a one-line string for the
 # prompt — or None if the panel has nothing useful to say. The brain reads
 # panel state attributes directly. Panels don't import this module.
+
+def _personality_block(memory):
+    """Build the 'WHAT YOU KNOW ABOUT THE USER' section.
+
+    Returns a multiline string suitable for prepending to the user prompt,
+    OR an empty string if there's nothing useful in memory yet.
+
+    The block is kept compact — a few hundred tokens at most. We include:
+      - User's name (so the model uses it naturally)
+      - Machine summary (so the model knows what hardware it's commenting on)
+      - Top apps with hours + behavior fingerprints (the personalization gold)
+
+    Behavior fingerprints (avg_gpu_when_top, avg_cpu) are the magic — they
+    let the model infer category WITHOUT us telling it "Ark is a game". A
+    process averaging 85% GPU when it's the top process is clearly a
+    GPU-hungry workload; the model can connect that to "looks like a game"
+    or "looks like a render" using its own knowledge of app names.
+    """
+    if memory is None:
+        return ""
+
+    parts = []
+    name = memory.get_user_name()
+    if name:
+        parts.append(f"User: {name}")
+
+    machine = memory.get_machine_summary()
+    if machine:
+        parts.append(f"Machine: {machine}")
+
+    top = memory.get_top_apps(n=6)
+    if top:
+        # Keep each line compact. The avg_gpu_when_top hint is what lets
+        # the model infer "this is a graphics workload" without hardcoding.
+        app_lines = []
+        for a in top:
+            bits = [a["name"], f"{a['hours']:.1f}h"]
+            if a.get("avg_cpu") is not None:
+                bits.append(f"avg {a['avg_cpu']:.0f}% CPU")
+            gpu = a.get("avg_gpu_when_top")
+            if gpu is not None and gpu >= 30:
+                # Only mention GPU correlation when it's substantive — saves
+                # tokens AND draws the model's eye to the apps that matter
+                # for GPU-related observations.
+                bits.append(f"avg {gpu:.0f}% GPU when top")
+            app_lines.append("  - " + ", ".join(bits))
+        parts.append("Most-used apps (last 7d):\n" + "\n".join(app_lines))
+
+    if not parts:
+        return ""
+    return "WHAT YOU KNOW ABOUT THE USER:\n" + "\n".join(parts) + "\n\n"
+
 
 def summarize_cpu(p):
     if not p.values:
@@ -106,7 +165,7 @@ def summarize_network(p):
             f"{tx_mbps:.1f} Mbps up{peak_str}")
 
 
-def summarize_processes(p):
+def summarize_processes(p, memory=None):
     if not p.procs:
         return None
     parts = []
@@ -116,7 +175,28 @@ def summarize_processes(p):
             parts.append(f"{name} ({cpu:.0f}% CPU, {mem_mb:.0f}MB)")
         else:
             parts.append(f"{name} ({cpu:.0f}% CPU)")
-    return "Top procs: " + ", ".join(parts)
+    line = "Top procs: " + ", ".join(parts)
+
+    # Personalization hook: if the top process is one of max's frequent
+    # apps, inject a one-line behavioral fingerprint. The LLM uses this to
+    # make smart inferences ("avg 87% GPU when this is top → user's gaming")
+    # without us hardcoding any category labels.
+    if memory is not None and p.procs:
+        top_name = p.procs[0][2]
+        info = memory.lookup_app(top_name)
+        if info:
+            hours = info.get("hours")
+            avg_gpu = info.get("avg_gpu_when_top")
+            avg_cpu = info.get("avg_cpu")
+            hint_bits = [f"{hours:.1f}h over last 7d" if hours else None]
+            if avg_cpu is not None:
+                hint_bits.append(f"avg {avg_cpu:.0f}% CPU")
+            if avg_gpu is not None and avg_gpu >= 30:
+                hint_bits.append(f"avg {avg_gpu:.0f}% GPU when top")
+            hint = ", ".join(b for b in hint_bits if b)
+            if hint:
+                line += f"\n  ({top_name} is one of the user's frequent apps: {hint})"
+    return line
 
 
 def summarize_system(p):
@@ -155,11 +235,15 @@ PANEL_SUMMARIZERS = {
 }
 
 
-def build_observation_prompt(sections):
+def build_observation_prompt(sections, memory=None):
     """Build the (system, user) prompt pair for the LLM.
 
     sections is the panel list from winston.py — each entry is (panel, hz)
-    or just panel. Returns (system_prompt: str, user_prompt: str).
+    or just panel. memory is an optional brain.memory.Memory instance —
+    when provided, the prompt is personalized with what Winston knows
+    about the user.
+
+    Returns (system_prompt: str, user_prompt: str).
     """
     lines = []
     for entry in sections:
@@ -169,14 +253,20 @@ def build_observation_prompt(sections):
         if summarizer is None:
             continue  # not a panel we summarize (e.g. CpuGraphPanel, DiskPanel)
         try:
-            line = summarizer(panel)
+            # Only ProcessesPanel currently uses memory in its summarizer.
+            # We pass it via a kwarg so non-aware summarizers don't break.
+            if type(panel).__name__ == "ProcessesPanel":
+                line = summarizer(panel, memory=memory)
+            else:
+                line = summarizer(panel)
         except Exception:
             # A misbehaving panel shouldn't kill the whole prompt.
             continue
         if line:
             lines.append(line.strip())
 
-    user_prompt = "\n".join(lines) if lines else "(no observations available)"
+    snapshot = "\n".join(lines) if lines else "(no observations available)"
+    user_prompt = _personality_block(memory) + snapshot
     return SYSTEM_PROMPT, user_prompt
 
 
@@ -190,25 +280,32 @@ vital signs. Something just happened that's worth commenting on. Below \
 you'll see a TRIGGER (the specific thing that fired) and the current \
 system snapshot for context.
 
+If a "WHAT YOU KNOW" block is included, use it to add personal context — \
+e.g. if the trigger is high GPU and the top process is one of the user's \
+games, name the game.
+
 Rules:
 - ONE OR TWO short sentences max.
 - Comment on the TRIGGER specifically. Don't restate every metric.
 - Be observant and a little dry, like in your usual commentary.
 - If the trigger description is enough info, you don't need to dig further.
 - No preamble like "Looking at the data..." — just the observation.
+- Always respond in English.
 """
 
 
-def build_triggered_prompt(sections, trigger_event):
+def build_triggered_prompt(sections, trigger_event, memory=None):
     """Build a prompt focused on a specific trigger event.
 
     sections: panel list (for current state context)
     trigger_event: a brain.triggers.TriggerEvent
+    memory: optional brain.memory.Memory for personalization
 
     Returns (system, user).
     """
-    # Get the standard snapshot for context
-    _system, snapshot = build_observation_prompt(sections)
+    # Get the standard snapshot for context (already memory-personalized
+    # via build_observation_prompt)
+    _system, snapshot = build_observation_prompt(sections, memory=memory)
 
     user = (f"TRIGGER ({trigger_event.severity}): {trigger_event.description}\n"
             f"\n"
@@ -236,17 +333,22 @@ Rules:
                "Late-night session, max — I'm here.", "Welcome to the small hours."
 - Don't be effusive. A simple greeting is perfect.
 - No preamble, no metadata. Just the greeting.
+- Always respond in English.
 """
 
 
-def build_greeting_prompt(user_name=None, hour=None):
+def build_greeting_prompt(user_name=None, hour=None, memory=None):
     """Build the greeting prompt. Returns (system, user).
 
-    hour: 0-23 hour of day. If None, computed from current time.
+    hour:      0-23 hour of day. If None, computed from current time.
+    memory:    optional Memory; user_name falls back to memory.get_user_name()
     """
     if hour is None:
         from datetime import datetime
         hour = datetime.now().hour
+
+    if user_name is None and memory is not None:
+        user_name = memory.get_user_name()
 
     name_clause = (f"The user's name is {user_name}." if user_name
                    else "The user has not given a name.")
@@ -265,6 +367,7 @@ Rules:
 - If something stands out (a hot peak, a heavy day), mention it.
 - If everything looks normal, just say so briefly.
 - No preamble like "Looking at the log...".
+- Always respond in English.
 """
 
 
@@ -305,6 +408,9 @@ over a personal computer. The user has asked you a direct question. They \
 can see the dashboard — CPU, RAM, GPU, temperatures, network, processes. \
 Use the current observation snapshot below to answer them.
 
+If a "WHAT YOU KNOW" block is included, use it for personal context — \
+the user's name, their machine, their typical app patterns.
+
 Rules:
 - Be concise. 1-3 short sentences max.
 - Be direct and a little dry, but helpful.
@@ -312,20 +418,22 @@ Rules:
 - If you genuinely don't know or can't tell from the data, say so.
 - No preamble like "Looking at your system..." — just answer.
 - If the user asked a follow-up, treat the prior turns as context.
+- Always respond in English.
 """
 
 
-def build_conversational_prompt(sections, user_question, history=None):
+def build_conversational_prompt(sections, user_question, history=None, memory=None):
     """Build the prompt for a user-initiated question.
 
     sections: panel list (for current state context)
     user_question: the user's typed question
     history: optional list of (user_msg, assistant_msg) pairs from prior turns
+    memory: optional brain.memory.Memory for personalization
 
     Returns (system, user) where user includes the snapshot + history + question.
     """
     # Get current observation snapshot, same as periodic commentary
-    _system, snapshot = build_observation_prompt(sections)
+    _system, snapshot = build_observation_prompt(sections, memory=memory)
 
     parts = [
         "Current system snapshot:",

@@ -33,8 +33,23 @@ from theme import LABEL, SECONDARY, BRIGHT, MEDIUM, DIM
 # Rolling window for rate smoothing
 RATE_WINDOW_SEC = 2.0
 
-# How often the background thread polls the data source
-POLL_INTERVAL_SEC = 0.5
+# How often the background thread polls the data source.
+#
+# Why 5 seconds and not faster: each poll spawns a new PowerShell process
+# (Get-NetAdapterStatistics) over the WSL→Windows boundary. Process
+# creation alone is 50-200ms, and even though the work happens on a daemon
+# thread (with the GIL released during the subprocess wait), the GIL
+# handoffs around subprocess return are still enough to disrupt stdin
+# reading on the asyncio loop. We tested 0.5s, 2s, and 5s on the same
+# machine — 0.5s dropped ~1 in 20 keystrokes, 2s dropped occasional
+# letters, 5s is clean.
+#
+# Why network is uniquely bad and other panels with threads aren't:
+# pynvml (GPU) calls into a local Linux .so via ctypes — GIL releases
+# cleanly, no process spawn. Network has to cross WSL→Windows for every
+# sample, which is fundamentally heavier. The proper fix would be a long-
+# lived PowerShell session piped over stdin, eliminating per-call churn.
+POLL_INTERVAL_SEC = 5.0
 
 
 def _is_wsl():
@@ -111,10 +126,15 @@ class NetworkPanel:
         self.prefer_windows = prefer_windows
         self.source = "windows" if prefer_windows else "wsl"
 
-        # Start background polling thread for Windows source
+        # Start background polling thread for Windows source.
+        # WINSTON_NO_THREADS=1 or WINSTON_NO_NET=1 disables it — kept for
+        # diagnosing input-drop issues. Without the thread, network rates
+        # stay frozen at zero, but the rest of the dashboard is unaffected.
         self._stop_event = threading.Event()
         self._thread = None
-        if self.source == "windows":
+        _no_thread = (os.environ.get("WINSTON_NO_THREADS")
+                      or os.environ.get("WINSTON_NO_NET"))
+        if self.source == "windows" and not _no_thread:
             self._start_polling_thread()
         else:
             # For WSL/native source, prime with a first reading so the rate

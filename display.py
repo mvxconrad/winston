@@ -11,8 +11,14 @@ from textual.widgets import Static, Input
 
 # ──────────────── Custom chrome ────────────────
 class StatusBar(Static):
+    """Top-row status line. Refreshes are driven by the App's frame loop
+    (no own set_interval) so all UI updates ride a single clock — eliminates
+    visual jitter from independent timers and frees the asyncio loop from
+    one more competing timer."""
+
     def on_mount(self):
-        self.set_interval(1.0, self.refresh_status)
+        # Initial paint. After this, WinstonApp._frame_tick calls
+        # refresh_status() at 1Hz aligned with the master frame.
         self.refresh_status()
 
     def refresh_status(self):
@@ -71,10 +77,13 @@ class CommentaryPanel(Static):
     # Cursor blink rate while streaming
     CURSOR_BLINK_HZ = 2.5
 
-    def __init__(self, sections=None, config=None, **kwargs):
+    def __init__(self, sections=None, config=None, memory=None, **kwargs):
         super().__init__(**kwargs)
         self._sections = sections or []
         self._config = config or {"enabled": False}
+        # Optional Memory instance. When present, all prompts get the
+        # personality block and per-process behavior fingerprints.
+        self._memory = memory
 
         # Chat-log history: list of (timestamp_str, message, kind) tuples.
         # kind is "winston" (LLM output) or "user" (user question).
@@ -105,17 +114,50 @@ class CommentaryPanel(Static):
         self._startup_step = None
         self._cooldown_active = False
 
+        # Last trigger event that fired (for the BrainPanel to display).
+        # Tuple of (name, severity, time-str) or None.
+        self._last_event = None
+
+    # ──────────────── Read-only accessors (for BrainPanel) ────────
+    def get_state(self):
+        return self._state
+
+    def get_last_event(self):
+        return self._last_event
+
+    # ──────────────── Model tier selection ────────────────
+    def _pick_model(self, tier):
+        """Returns (model_name, keep_alive) for the given tier.
+
+        tier: "fast" | "quality"
+        When LLM_USE_TIERED is False, both tiers fall back to single-model.
+        """
+        cfg = self._config
+        if not cfg.get("use_tiered", False):
+            return cfg.get("model"), -1
+        if tier == "quality":
+            return (cfg.get("model_quality") or cfg.get("model"),
+                    cfg.get("quality_keep_alive_sec", 300))
+        return (cfg.get("model_fast") or cfg.get("model"), -1)
+
     # ──────────────── Lifecycle ────────────────
     def on_mount(self):
         if not self._config.get("enabled", False):
             self._paint()
             return
 
-        # Cursor blink
-        self.set_interval(1.0 / self.CURSOR_BLINK_HZ, self._toggle_cursor)
-        # Typewriter — emits chars at the configured rate
-        tps = self._config.get("typewriter_tps", 25)
-        self.set_interval(1.0 / tps, self._typewriter_tick)
+        # Cursor blink + typewriter intervals are STARTED LAZILY in
+        # _begin_streaming() and STOPPED in _finalize_message(). We don't
+        # schedule them here at mount time. Reason: the typewriter ticks
+        # at 25Hz and the blinker at 2.5Hz, but both are no-ops while
+        # idle. Even an empty asyncio callback at 25Hz competes with the
+        # input widget's keystroke processing — the dashboard has plenty
+        # of other timers (panels, logger, triggers) and one more high-
+        # frequency one was enough to drop ~10% of typed characters in
+        # the ASK input. Holding the timers off until there's actually
+        # something to type out keeps the loop quiet between messages.
+        self._cursor_timer = None
+        self._typewriter_timer = None
 
         # Begin startup sequence (if enabled), else jump to regular loop
         if self._config.get("startup_greeting", True):
@@ -125,6 +167,31 @@ class CommentaryPanel(Static):
             self._begin_regular_loop()
         self._paint()
 
+    def _start_stream_timers(self):
+        """Schedule cursor blink + typewriter ticks. Idempotent."""
+        if self._cursor_timer is None:
+            self._cursor_timer = self.set_interval(
+                1.0 / self.CURSOR_BLINK_HZ, self._toggle_cursor)
+        if self._typewriter_timer is None:
+            tps = self._config.get("typewriter_tps", 25)
+            self._typewriter_timer = self.set_interval(
+                1.0 / tps, self._typewriter_tick)
+
+    def _stop_stream_timers(self):
+        """Tear down cursor blink + typewriter ticks. Idempotent."""
+        if self._cursor_timer is not None:
+            try:
+                self._cursor_timer.stop()
+            except Exception:
+                pass
+            self._cursor_timer = None
+        if self._typewriter_timer is not None:
+            try:
+                self._typewriter_timer.stop()
+            except Exception:
+                pass
+            self._typewriter_timer = None
+
     # ──────────────── Startup sequence ────────────────
     def _trigger_greeting(self):
         from brain.client import generate_stream_async
@@ -132,15 +199,17 @@ class CommentaryPanel(Static):
 
         try:
             system, user = build_greeting_prompt(
-                user_name=self._config.get("user_name")
+                user_name=self._config.get("user_name"),
+                memory=self._memory,
             )
         except Exception:
             self._on_startup_step_done()
             return
 
         self._begin_streaming()
+        model, keep_alive = self._pick_model("quality")
         generate_stream_async(
-            user, system=system, model=self._config.get("model"),
+            user, system=system, model=model, keep_alive=keep_alive,
             on_chunk=self._on_chunk_worker,
             on_done=self._on_startup_done_worker,
             on_error=self._on_startup_error_worker,
@@ -168,8 +237,9 @@ class CommentaryPanel(Static):
     def _begin_retrospective_call(self, system, user):
         from brain.client import generate_stream_async
         self._begin_streaming()
+        model, keep_alive = self._pick_model("quality")
         generate_stream_async(
-            user, system=system, model=self._config.get("model"),
+            user, system=system, model=model, keep_alive=keep_alive,
             on_chunk=self._on_chunk_worker,
             on_done=self._on_startup_done_worker,
             on_error=self._on_startup_error_worker,
@@ -217,6 +287,17 @@ class CommentaryPanel(Static):
         """Called every second. Updates baselines, checks for events,
         fires commentary if appropriate."""
         import time
+        _t0 = time.monotonic()
+        try:
+            self._tick_triggers_inner()
+        finally:
+            try:
+                self.app._record_timing("CommentaryPanel.triggers", _t0)
+            except Exception:
+                pass
+
+    def _tick_triggers_inner(self):
+        import time
         now = time.monotonic()
 
         # Always update baselines, even if we're streaming. Baselines should
@@ -261,15 +342,24 @@ class CommentaryPanel(Static):
         """Fire commentary for a specific trigger event."""
         from brain.client import generate_stream_async
         from brain.prompt import build_triggered_prompt
+        from datetime import datetime
 
         try:
-            system, user = build_triggered_prompt(self._sections, event)
+            system, user = build_triggered_prompt(self._sections, event,
+                                                  memory=self._memory)
         except Exception:
             return
 
+        # Stash for the BrainPanel
+        self._last_event = (event.name, event.severity,
+                            datetime.now().strftime("%H:%M:%S"))
+
         self._begin_streaming()
+        # Alerts get the quality model; routine + notable use fast.
+        tier = "quality" if event.severity == "alert" else "fast"
+        model, keep_alive = self._pick_model(tier)
         generate_stream_async(
-            user, system=system, model=self._config.get("model"),
+            user, system=system, model=model, keep_alive=keep_alive,
             on_chunk=self._on_chunk_worker,
             on_done=self._on_done_worker,
             on_error=self._on_error_worker,
@@ -281,15 +371,17 @@ class CommentaryPanel(Static):
         from brain.prompt import build_observation_prompt
 
         try:
-            system, user = build_observation_prompt(self._sections)
+            system, user = build_observation_prompt(self._sections,
+                                                    memory=self._memory)
         except Exception:
             self._state = "ERROR"
             self._paint()
             return
 
         self._begin_streaming()
+        model, keep_alive = self._pick_model("fast")
         generate_stream_async(
-            user, system=system, model=self._config.get("model"),
+            user, system=system, model=model, keep_alive=keep_alive,
             on_chunk=self._on_chunk_worker,
             on_done=self._on_done_worker,
             on_error=self._on_error_worker,
@@ -302,6 +394,7 @@ class CommentaryPanel(Static):
         self._typed_chars = 0
         self._stream_complete = False
         self._state = "THINKING"
+        self._start_stream_timers()
         self._paint()
 
     def _typewriter_tick(self):
@@ -337,6 +430,9 @@ class CommentaryPanel(Static):
         self._stream_complete = False
         self._state = "IDLE"
         self._cooldown_active = True
+        # Stop the per-stream timers so the asyncio loop is quiet again
+        # while we're idle — keeps the ASK input keystrokes responsive.
+        self._stop_stream_timers()
         self._paint()
 
         # Cooldown: after the inter-message pause, allow next message to start
@@ -386,7 +482,8 @@ class CommentaryPanel(Static):
         # Build prompt with snapshot + multi-turn context + the question
         try:
             system, user_prompt = build_conversational_prompt(
-                self._sections, question.strip(), history=self._qa_history
+                self._sections, question.strip(), history=self._qa_history,
+                memory=self._memory,
             )
         except Exception:
             self._state = "ERROR"
@@ -397,8 +494,9 @@ class CommentaryPanel(Static):
         self._pending_user_question = question.strip()
 
         self._begin_streaming()
+        model, keep_alive = self._pick_model("quality")
         generate_stream_async(
-            user_prompt, system=system, model=self._config.get("model"),
+            user_prompt, system=system, model=model, keep_alive=keep_alive,
             on_chunk=self._on_chunk_worker,
             on_done=self._on_done_worker,
             on_error=self._on_error_worker,
@@ -437,6 +535,9 @@ class CommentaryPanel(Static):
 
     def _on_error(self):
         self._state = "ERROR"
+        # Error short-circuits the stream — make sure we tear the timers
+        # down here too, otherwise they keep firing in the ERROR state.
+        self._stop_stream_timers()
         self._paint()
         # Still treat as a finished step so startup can advance
         if self._startup_step is not None:
@@ -757,6 +858,15 @@ class WinstonApp(App):
         padding: 0 1;
     }
 
+    /* Brain panel — Winston's internal state. Sits below commentary. */
+    #brain_panel {
+        height: 9;
+        border: round cyan;
+        border-title-color: ansi_bright_cyan;
+        border-title-style: bold;
+        padding: 0 1;
+    }
+
     /* Conversational input — single-line text input below commentary */
     #user_input {
         height: 3;
@@ -778,7 +888,7 @@ class WinstonApp(App):
         ("slash", "focus_input", "Ask"),
     ]
 
-    def __init__(self, sections, logger, logger_hz=1.0, llm_config=None):
+    def __init__(self, sections, logger, logger_hz=1.0, llm_config=None, memory=None):
         super().__init__()
         # sections is a list of (panel_instance, refresh_hz) tuples
         # We split into parallel lists for convenience
@@ -789,6 +899,9 @@ class WinstonApp(App):
         # LLM config dict — passed through to CommentaryPanel.
         # See run() for the keys.
         self.llm_config = llm_config or {"enabled": False}
+        # Persistent memory (brain.memory.Memory or None)
+        self.memory = memory
+        self.brain_panel = None  # set in compose() if enabled
 
         (self.cpu_graph,
          self.cpu,
@@ -857,12 +970,33 @@ class WinstonApp(App):
 
         commentary = CommentaryPanel(sections=self.sections,
                                       config=self.llm_config,
+                                      memory=self.memory,
                                       id="commentary_panel")
         # Panel height = line count + borders (2) + padding (0) + a little
         # buffer (1). With config['lines'] of 5 -> 8 cells.
         commentary.styles.height = self.llm_config.get("lines", 5) + 3
         commentary.border_title = "─ COMMENTARY ─"
         yield commentary
+
+        # Brain panel: Winston's internal state, below commentary. Optional —
+        # gated by config.SHOW_BRAIN_PANEL so it can be turned off without
+        # touching code (used for diagnosing UI issues).
+        show_brain = (self.llm_config.get("enabled", False)
+                      and self.llm_config.get("show_brain_panel", True))
+        if show_brain:
+            from panels.brain import BrainPanel
+            from brain.client import status as client_status
+            brain = BrainPanel(
+                memory=self.memory,
+                get_state=commentary.get_state,
+                get_last_event=commentary.get_last_event,
+                client_status=client_status,
+            )
+            self.brain_panel = brain
+            brain_widget = PanelWidget(brain, id="brain_panel")
+            brain_widget.border_title = "─ BRAIN ─"
+            self._panel_widgets.setdefault(id(brain), []).append(brain_widget)
+            yield brain_widget
 
         # Conversational input — only shown if LLM is enabled. Press / to focus.
         if self.llm_config.get("enabled", False):
@@ -876,6 +1010,38 @@ class WinstonApp(App):
         yield FooterBar(id="footer_bar")
 
     def on_mount(self) -> None:
+        # ── Diagnostic env vars (for input-drop bisection) ────────────
+        # WINSTON_DISABLE_PANELS=GpuPanel,CpuGraphPanel  → skip those
+        #   panels' ticks entirely. Useful for narrowing which panel is
+        #   blocking the event loop long enough to drop keystrokes.
+        # WINSTON_TIMING=1 → log any tick > THRESHOLD ms to a file. Lets
+        #   you see which tick spiked at the moment a keystroke vanished.
+        import os
+        import time as _t
+        self._disabled_panels = set(
+            x.strip() for x in os.environ.get("WINSTON_DISABLE_PANELS", "").split(",")
+            if x.strip()
+        )
+        self._timing_enabled = bool(os.environ.get("WINSTON_TIMING"))
+        self._timing_threshold_ms = float(os.environ.get("WINSTON_TIMING_MS", "10"))
+        self._timing_path = os.environ.get("WINSTON_TIMING_LOG",
+                                           "/tmp/winston_timing.log")
+        if self._timing_enabled:
+            # Truncate the log on each launch so the file reflects this run.
+            try:
+                with open(self._timing_path, "w") as f:
+                    f.write(f"# winston timing log — threshold {self._timing_threshold_ms}ms\n")
+                    f.write("# columns: wall_time_iso  source  duration_ms\n")
+            except OSError:
+                self._timing_enabled = False
+        if self._disabled_panels:
+            print(f"[diag] WINSTON_DISABLE_PANELS active: "
+                  f"{sorted(self._disabled_panels)}")
+        if self._timing_enabled:
+            print(f"[diag] WINSTON_TIMING active: "
+                  f"logging ticks > {self._timing_threshold_ms}ms to "
+                  f"{self._timing_path}")
+
         # Panels were already primed in run() before this app started.
         # Just do an immediate widget refresh so the prepopulated data shows.
         for panel, _hz in zip(self.sections, self.section_rates):
@@ -885,36 +1051,162 @@ class WinstonApp(App):
                 except Exception:
                     pass
 
-        # Schedule each panel on its own interval
+        # Prime the brain panel (it's not in self.sections, so the loop
+        # above doesn't catch it).
+        if self.brain_panel is not None:
+            try:
+                self.brain_panel.update()
+            except Exception:
+                pass
+            for w in self._panel_widgets.get(id(self.brain_panel), []):
+                try:
+                    w.refresh_panel()
+                except Exception:
+                    pass
+
+        # ── Master frame loop ────────────────────────────────────────
+        # ONE timer drives the whole dashboard. Each panel keeps its own
+        # natural rate (CPU at 4Hz, disk at 0.1Hz, etc) but updates only
+        # fire when the per-panel interval has elapsed since the last
+        # update. Widget refreshes are batched — every panel that updated
+        # this frame gets refreshed in a single pass, so Textual's
+        # compositor sees one coherent batch instead of 14 uncoordinated
+        # refreshes per second. That's why this fixes both the visual
+        # jitter (mismatched cadences) AND the input-drop bug (compositor
+        # passes piling up against stdin processing).
+        now = _t.monotonic()
+        self._panel_intervals = {}
+        self._panel_due_at = {}
         for panel, hz in zip(self.sections, self.section_rates):
             interval = 1.0 / hz
-            self.set_interval(interval, self._make_tick(panel))
+            self._panel_intervals[id(panel)] = interval
+            # Stagger the first-due times so panels don't all fire on the
+            # same frame on launch — spreads load over the first second.
+            self._panel_due_at[id(panel)] = now + interval
 
-        # Logger ticks at its own rate, regardless of panel rates
-        self.set_interval(1.0 / self.logger_hz, self._log_tick)
+        self._log_interval = 1.0 / self.logger_hz
+        self._log_due_at = now + self._log_interval
 
-    def _make_tick(self, panel):
-        """Return a closure that updates a specific panel and refreshes its widgets."""
-        def tick():
+        self._brain_due_at = now + 1.0
+        self._status_due_at = now + 1.0
+
+        # Resolve the StatusBar widget once so the frame loop doesn't
+        # query the DOM 30 times a second.
+        try:
+            self._status_bar = self.query_one("#status_bar", StatusBar)
+        except Exception:
+            self._status_bar = None
+
+        # Read the master frame rate from config. Default 30 if not set
+        # (e.g. older config.py without FRAME_HZ).
+        import config as _cfg
+        frame_hz = float(getattr(_cfg, "FRAME_HZ", 30.0))
+        self._frame_interval = 1.0 / frame_hz
+        self.set_interval(self._frame_interval, self._frame_tick)
+
+    def _record_timing(self, source, started_at):
+        """Append a timing line to the log if the elapsed exceeds threshold.
+        Cheap when WINSTON_TIMING is off — early returns without I/O."""
+        if not self._timing_enabled:
+            return
+        import time as _t
+        elapsed_ms = (_t.monotonic() - started_at) * 1000.0
+        if elapsed_ms < self._timing_threshold_ms:
+            return
+        try:
+            from datetime import datetime as _dt
+            with open(self._timing_path, "a") as f:
+                f.write(f"{_dt.now().isoformat(timespec='milliseconds')}  "
+                        f"{source}  {elapsed_ms:.1f}ms\n")
+        except OSError:
+            pass
+
+    async def _frame_tick(self):
+        """Master tick. Runs at FRAME_HZ. Each iteration:
+          - For each panel whose interval has elapsed: panel.update() then
+            refresh its widgets.
+          - Same gating for brain panel (1Hz), status bar (1Hz), logger.
+        Items not yet due are skipped — they'll fire on a later frame.
+
+        Async + explicit `await asyncio.sleep(0)` yields between work
+        segments. Even if no individual segment is slow, several segments
+        in the same frame add up to a contiguous block where stdin can't
+        be read. Yielding lets the asyncio loop process keystrokes between
+        each panel's update — drops to 1-2ms gaps instead of 8-15ms gaps.
+        """
+        import asyncio
+        import time as _t
+        now = _t.monotonic()
+
+        # ── Data panels ──
+        # One panel per yield: gives input a turn between every panel's
+        # update + refresh. The yield is a no-op when stdin is idle.
+        for panel in self.sections:
+            cls = type(panel).__name__
+            if cls in self._disabled_panels:
+                continue
+            if now < self._panel_due_at.get(id(panel), 0):
+                continue
+            t0 = _t.monotonic()
+            self._panel_due_at[id(panel)] = now + self._panel_intervals[id(panel)]
             try:
                 panel.update()
             except Exception:
                 # Don't let one panel's error kill the whole app
-                return
-            # Refresh associated widgets
+                continue
             for w in self._panel_widgets.get(id(panel), []):
                 try:
                     w.refresh_panel()
                 except Exception:
                     pass
-        return tick
+            self._record_timing(cls, t0)
+            await asyncio.sleep(0)
 
-    def _log_tick(self):
-        """Logger tick — write a row at LOGGER_HZ."""
-        try:
-            self.logger.log(self.sections)
-        except Exception:
-            pass
+        # ── Brain panel (1Hz, dirty-check) ──
+        if (self.brain_panel is not None
+                and "BrainPanel" not in self._disabled_panels
+                and now >= self._brain_due_at):
+            t0 = _t.monotonic()
+            self._brain_due_at = now + 1.0
+            bp = self.brain_panel
+            try:
+                bp.update()
+                if bp.is_dirty():
+                    for w in self._panel_widgets.get(id(bp), []):
+                        try:
+                            w.refresh_panel()
+                        except Exception:
+                            pass
+                    self._record_timing("BrainPanel", t0)
+                else:
+                    self._record_timing("BrainPanel(skip)", t0)
+            except Exception:
+                pass
+            await asyncio.sleep(0)
+
+        # ── Status bar (1Hz) ──
+        if (self._status_bar is not None
+                and "StatusBar" not in self._disabled_panels
+                and now >= self._status_due_at):
+            t0 = _t.monotonic()
+            self._status_due_at = now + 1.0
+            try:
+                self._status_bar.refresh_status()
+            except Exception:
+                pass
+            self._record_timing("StatusBar", t0)
+            await asyncio.sleep(0)
+
+        # ── Logger ──
+        if ("Logger" not in self._disabled_panels
+                and now >= self._log_due_at):
+            t0 = _t.monotonic()
+            self._log_due_at = now + self._log_interval
+            try:
+                self.logger.log(self.sections)
+            except Exception:
+                pass
+            self._record_timing("Logger", t0)
 
     def action_reset_history(self) -> None:
         for s in self.sections:
@@ -997,6 +1289,11 @@ def run(sections, logger, config=None):
     llm_config = {
         "enabled":                 config.LLM_ENABLED,
         "model":                   config.LLM_MODEL,
+        "use_tiered":              getattr(config, "LLM_USE_TIERED", False),
+        "model_fast":              getattr(config, "LLM_MODEL_FAST", config.LLM_MODEL),
+        "model_quality":           getattr(config, "LLM_MODEL_QUALITY", config.LLM_MODEL),
+        "quality_keep_alive_sec":  getattr(config, "LLM_QUALITY_KEEP_ALIVE_SEC", 300),
+        "show_brain_panel":        getattr(config, "SHOW_BRAIN_PANEL", True),
         "user_name":               config.USER_NAME,
         "startup_greeting":        config.STARTUP_GREETING,
         "typewriter_tps":          config.TYPEWRITER_TPS,
@@ -1006,7 +1303,34 @@ def run(sections, logger, config=None):
         "stale_quiet_threshold_sec": config.STALE_QUIET_THRESHOLD_SEC,
         "triggers":                config.TRIGGERS,
     }
+
+    # Bootstrap persistent memory.
+    memory = None
+    if config.LLM_ENABLED:
+        try:
+            from brain.memory import Memory
+            memory = Memory()
+            memory.set_user(name=config.USER_NAME)
+            gpu_panel = next((p for p, _ in sections
+                              if type(p).__name__ == "GpuPanel"), None)
+            ram_panel = next((p for p, _ in sections
+                              if type(p).__name__ == "RamPanel"), None)
+            memory.set_machine_facts(gpu_panel=gpu_panel, ram_panel=ram_panel)
+            print("WINSTON :: scanning log for personalization...", end=" ",
+                  flush=True)
+            info = memory.learn_from_log(hours=168)
+            if info.get("log_missing"):
+                print("(no log yet — Winston starts learning today)")
+            else:
+                print(f"learned {info.get('ranked_apps', 0)} apps "
+                      f"from {info.get('rows_scanned', 0)} rows.")
+            memory.save()
+        except Exception as e:
+            print(f"(memory init failed: {e!r} — continuing without it)")
+            memory = None
+
     app = WinstonApp(sections, logger,
                      logger_hz=config.LOGGER_HZ,
-                     llm_config=llm_config)
+                     llm_config=llm_config,
+                     memory=memory)
     app.run()
