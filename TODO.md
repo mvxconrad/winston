@@ -176,6 +176,82 @@ better. Reasonable Tier 1 (read-only) ideas to add to Stage 5.6:
 - [ ] Custom usage-pattern alerts — "warn me when Chrome's RAM exceeds
       its 95th percentile"
 
+
+## Stage 5.9: Cloud LLM backend (Claude API as a slash command)
+For when the local 7B isn't quite smart enough — type
+`/claude what's been eating my GPU lately?` and the question goes to
+Claude with the same Winston persona + state context. Local Ollama still
+handles everything else.
+
+### Difficulty: easy-medium (~2-3 hours)
+The hard part is already done — `brain/client.py` exposes a clean
+`generate_stream_async(prompt, on_chunk, on_done, on_error, ...)` shape,
+and `CommentaryPanel` is already backend-agnostic at the callback level.
+We just need a second client that fits the same shape.
+
+### Implementation sketch
+- [ ] `brain/claude_client.py` — mirrors `brain/client.py`'s public API:
+      - `generate_stream_async(prompt, on_chunk, on_done, on_error, system=, model=, ...)`
+      - Internally uses `anthropic.Anthropic().messages.stream(...)` —
+        SDK fires per-token deltas via `text_stream`, same shape as
+        Ollama's chunks
+      - Own FIFO worker thread (don't share the Ollama queue — different
+        latency profile, different rate limits)
+- [ ] Slash command parser in `CommentaryPanel.ask_user()` — detect
+      `/claude ...` prefix, strip it, route to `claude_client` instead
+      of the Ollama `generate_stream_async`
+- [ ] Same prompt builders work as-is (`brain/prompt.py`) — Claude takes
+      a `system=` and `messages=[]`, both compatible with what we
+      already build for Ollama
+- [ ] **Use prompt caching** on the system prompt + machine facts +
+      memory block — they're stable across calls and cut input tokens
+      ~90%. `cache_control: {"type": "ephemeral"}` on those blocks.
+- [ ] Persona consistency: keep the existing Winston system prompt
+      verbatim. One extra line: "Match Winston's voice — dry,
+      observant, concise. Don't introduce yourself as Claude."
+
+### Config (add to config.py)
+- [ ] `CLAUDE_ENABLED = False` (default off; opt-in)
+- [ ] `CLAUDE_MODEL = "claude-sonnet-4-6"` — right cost/quality tier
+      for "smarter Winston question." Opus 4.7 if you want max smart.
+- [ ] API key from `ANTHROPIC_API_KEY` env var only — never read or
+      write to disk, never log
+
+### UX touches
+- [ ] BRAIN panel `MODEL` line shows `claude-sonnet-4-6` while a
+      `/claude` answer is streaming, then back to local model when idle
+- [ ] STATE shows `THINKING (claude)` for cloud calls — distinguishes
+      from local thinking visually
+- [ ] Optional: small "via claude" subscript on the streamed answer in
+      COMMENTARY so it's obvious which backend answered
+
+### Things to think about before shipping
+- **Cost.** Sonnet is roughly $3/M input + $15/M output. With prompt
+  caching that's a few cents per question. Add a soft daily cap
+  (`CLAUDE_DAILY_USD_CAP`, default $1?) and refuse if exceeded.
+- **Failure mode.** API down or key invalid → fall back to local 7B
+  with a banner: "(claude unavailable — answered with local 7B)"
+- **Streaming.** Anthropic SDK chunks vary in size; `sanitize_chunk()`
+  should still apply (cheap).
+- **Privacy.** Don't include the full CSV log or all of memory in the
+  prompt — only the panel snapshot + last 3 Q&A. We don't want to ship
+  process names to a third party by surprise.
+
+### Why slash command, not a button
+A button needs a new Textual widget, focus management, layout slot,
+keybinding. The slash command is a 5-line parser in `ask_user()`. Both
+end up in the same input field. If we later want a button it just
+calls the same code path.
+
+
+## Stage 6: Local LLM tuning
+- [ ] Compare 7B vs 3B speed/quality tradeoff with our current prompts
+- [ ] Optimize prompts for the 3B (it's doing 90% of the work now —
+      worth tightening)
+- [ ] Try llama3.1:8b for `/`-asks once the Claude option is in (so
+      there's a "smarter local" path before going cloud)
+
+
 ## Stage 7: Long-term Tracking
 - [ ] Migrate from CSV to SQLite when log gets unwieldy
 - [ ] Daily/weekly summaries
@@ -196,3 +272,62 @@ better. Reasonable Tier 1 (read-only) ideas to add to Stage 5.6:
 - [ ] Later: edges include network connections, shared file handles
 - [ ] AI reads graph state for commentary ("chrome cluster grew 40%")
 - [ ] Eventually: web UI mode for live graph alongside TUI
+
+
+## Stage 10: PyQt6 desktop app — the big rewrite
+The terminal is the bottleneck. When a game runs hot, Windows starves
+the terminal of redraws, ASCII can only encode so much, and there's no
+real scroll. The interim throttle (`GPU_BUSY_*` in `config.py`) makes
+gaming bearable but the long-term answer is a real desktop app — Winston
+running in its own GPU-accelerated window like btop's GUI cousins.
+
+### Why PyQt6 (not web, not Electron)
+Stays in pure Python. No frontend stack to maintain, no API/server layer,
+no browser tab. User runs `python winston.py` (or a packaged `.exe`) and
+a window opens. pyqtgraph hits 60fps for live charts trivially. Native
+look, native scroll, native window controls.
+
+### Architecture
+The data layer is already separable — only `display.py` ties things to
+Textual. Replace `display.py` with `gui.py` and the `panels/` + `brain/`
+modules don't change.
+
+- [ ] `gui.py` — `QApplication` + `QMainWindow` mirroring the current
+      Textual layout
+- [ ] One `QTimer` per panel rate (or a single 60Hz master like the
+      Textual frame loop) — same data-update + widget-refresh split
+- [ ] `pyqtgraph.PlotWidget` for the CPU graph + network graphs (real
+      lines, real axes, real anti-aliasing — no braille)
+- [ ] Real `QProgressBar` for CPU/RAM/disk/GPU bars (or `QFrame` with
+      stylesheets if we want the heatmap-colored chunky look kept)
+- [ ] `QTextEdit` (read-only) for COMMENTARY — proper scroll, proper
+      wrapping, proper text selection
+- [ ] `QLineEdit` for the ASK input — focus management is built-in
+- [ ] Keep `theme.py` as the single source of color truth — Qt accepts
+      hex strings, so `heat_pct(percent)` returns a valid value for
+      both Rich and Qt without changes
+
+### What we get for free
+- Smooth 60fps even while gaming (Qt renders on GPU, doesn't compete
+  with the game for the same surface)
+- Real scroll, real selection, real copy/paste
+- Real charts — pyqtgraph supports millions of points, log scale,
+  zoom/pan with mouse, all without performance worry
+- Window resizing actually works
+- System tray icon possibility (Stage 8 item gets easier)
+- Packageable into a Windows `.exe` via PyInstaller — single click to
+  launch, no Python install needed
+
+### Effort: ~2 weeks part-time
+- Week 1: skeleton — main window, layout, data binding, panel widgets
+- Week 2: charts, COMMENTARY/BRAIN polish, theme tuning, packaging
+
+### Things to think about
+- Keep the TUI as an alternate frontend? `winston.py --tui` falls back
+  to current Textual app, default is the GUI. Same data layer.
+- High-DPI scaling — Qt handles it well but the layout math needs a
+  pass.
+- Windows packaging: PyInstaller builds a ~50MB single exe. Acceptable
+  for a personal tool, ugly for distribution.
+- Auto-start on Windows boot? Easy with a startup-folder shortcut to
+  the packaged exe.

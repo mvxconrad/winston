@@ -36,6 +36,16 @@ this is the file.
 # is repainted. 30 is comfortable; 60 is silky if your CPU has the headroom.
 FRAME_HZ       = 30.0
 
+# GPU-busy throttle: when a game is running the GPU spikes and the terminal
+# emulator gets starved of redraws by Windows, making Winston feel laggy.
+# We watch the GPU util and drop the dashboard's effective frame rate to
+# ~5fps when the GPU is sustained above GPU_BUSY_PCT for GPU_BUSY_HOLD_SEC.
+# Resumes full speed after GPU_CALM_HOLD_SEC of cool-down. Pure cosmetic
+# throttle — background data threads keep running at their normal rates.
+GPU_BUSY_PCT       = 50      # threshold (%)
+GPU_BUSY_HOLD_SEC  = 3.0     # how long above threshold before throttling
+GPU_CALM_HOLD_SEC  = 5.0     # how long below threshold before resuming
+
 CPU_GRAPH_HZ   = 4.0
 CPU_CORES_HZ   = 4.0
 RAM_HZ         = 2.0

@@ -1116,6 +1116,59 @@ class WinstonApp(App):
         self._frame_interval = 1.0 / frame_hz
         self.set_interval(self._frame_interval, self._frame_tick)
 
+        # ── GPU-busy throttle ──────────────────────────────────────
+        # When a game is running the GPU spikes and the terminal emulator
+        # gets starved of redraws by Windows, making Winston feel laggy.
+        # We watch GpuPanel's cached util (already on its own thread) and
+        # when it sustains above GPU_BUSY_PCT for GPU_BUSY_HOLD_SEC, we
+        # drop the dashboard's effective frame rate by skipping most ticks.
+        # Once util drops back, we resume full speed within the same hold
+        # window. Pure cosmetic throttle — data threads keep running.
+        self._gpu_busy = False
+        self._gpu_busy_since = None
+        self._gpu_calm_since = None
+        self._busy_skip_counter = 0
+        # Reads from cached GpuPanel state so this is sub-µs per frame.
+        self._gpu_panel = next(
+            (p for p in self.sections if type(p).__name__ == "GpuPanel"),
+            None,
+        )
+
+    def _update_gpu_busy_state(self, now):
+        """Return True if we should be in busy-throttle mode this frame.
+
+        Uses hysteresis so the throttle doesn't oscillate when GPU util
+        bobs around the threshold:
+          - Need GPU_BUSY_HOLD_SEC of sustained util > GPU_BUSY_PCT to
+            ENTER busy mode
+          - Need GPU_CALM_HOLD_SEC of util < GPU_BUSY_PCT to EXIT
+        """
+        import config as _cfg
+        busy_pct = getattr(_cfg, "GPU_BUSY_PCT", 50)
+        busy_hold = getattr(_cfg, "GPU_BUSY_HOLD_SEC", 3.0)
+        calm_hold = getattr(_cfg, "GPU_CALM_HOLD_SEC", 5.0)
+
+        if self._gpu_panel is None or not self._gpu_panel.gpus:
+            return False
+        util = self._gpu_panel.gpus[0].get("util") or 0
+
+        if util > busy_pct:
+            self._gpu_calm_since = None
+            if self._gpu_busy_since is None:
+                self._gpu_busy_since = now
+            elif (not self._gpu_busy
+                  and (now - self._gpu_busy_since) >= busy_hold):
+                self._gpu_busy = True
+        else:
+            self._gpu_busy_since = None
+            if self._gpu_calm_since is None:
+                self._gpu_calm_since = now
+            elif (self._gpu_busy
+                  and (now - self._gpu_calm_since) >= calm_hold):
+                self._gpu_busy = False
+
+        return self._gpu_busy
+
     def _record_timing(self, source, started_at):
         """Append a timing line to the log if the elapsed exceeds threshold.
         Cheap when WINSTON_TIMING is off — early returns without I/O."""
@@ -1149,6 +1202,17 @@ class WinstonApp(App):
         import asyncio
         import time as _t
         now = _t.monotonic()
+
+        # ── GPU-busy throttle ──
+        # Drop to ~5fps (skip ~5 of every 6 frames) when a game is running.
+        # Logger + critical 1Hz things still fire because the inner due-time
+        # gating handles that — most data panels just won't refresh as
+        # often. Frees the terminal from competing with the game for redraws.
+        if self._update_gpu_busy_state(now):
+            self._busy_skip_counter += 1
+            if self._busy_skip_counter % 6 != 0:
+                return
+            self._busy_skip_counter = 0
 
         # ── Data panels ──
         # One panel per yield: gives input a turn between every panel's
