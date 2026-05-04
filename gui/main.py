@@ -63,7 +63,14 @@ def _mono(size=10):
 # ──────────────── Reusable widgets ────────────────
 class PanelFrame(QFrame):
     """Bordered panel container — visual equivalent of the TUI's round
-    panel borders. One titled box per data panel."""
+    panel borders. One titled box per data panel.
+
+    Tight margins by design: the dashboard is densest with minimal
+    padding, matching the TUI screenshots in README. Each child view is
+    expected to call `layout().addStretch(1)` at the end of its own
+    construction so content sits at the top of the frame instead of
+    spreading to fill all available vertical space.
+    """
 
     def __init__(self, title, parent=None, accent=False):
         super().__init__(parent)
@@ -73,13 +80,13 @@ class PanelFrame(QFrame):
         self.setStyleSheet(f"""
             PanelFrame {{
                 border: 1px solid {border_color};
-                border-radius: 6px;
+                border-radius: 4px;
                 background: {BG};
             }}
         """)
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(8, 4, 8, 6)
-        outer.setSpacing(2)
+        outer.setContentsMargins(8, 2, 8, 4)
+        outer.setSpacing(1)
 
         self._title = QLabel(f"─ {title} ─")
         self._title.setFont(_mono(9))
@@ -89,7 +96,7 @@ class PanelFrame(QFrame):
         self._body = QVBoxLayout()
         self._body.setContentsMargins(0, 0, 0, 0)
         self._body.setSpacing(2)
-        outer.addLayout(self._body)
+        outer.addLayout(self._body, stretch=1)
 
     def body(self):
         return self._body
@@ -226,11 +233,18 @@ class CoresView(QWidget):
                 row.addWidget(val_label)
                 self._grid.addLayout(row)
                 self._rows.append((idx_label, bar, val_label))
+            # Stretch absorbs any leftover vertical space so the bars
+            # stay packed at the top of the panel rather than spreading
+            # out.
+            self._grid.addStretch(1)
 
         for (idx_label, bar, val_label), v in zip(self._rows, values):
             bar.setValue(v)
             color = heat_pct(v)
-            val_label.setText(f"{int(round(v))}%")
+            # Right-pad the integer to 3 chars so 5 / 16 / 100 all line
+            # up at the right edge instead of dancing one char left/right
+            # depending on digit count.
+            val_label.setText(f"{int(round(v)):>3d}%")
             val_label.setStyleSheet(f"color: {color};")
 
 
@@ -260,7 +274,14 @@ class MemoryView(QWidget):
         used = getattr(self.panel, "used", 0) or 0
         total = getattr(self.panel, "total", 0) or 0
         gb = lambda b: b / (1024 ** 3)
-        self._label.setText(f"{gb(used):.1f}GB of {gb(total):.1f}GB")
+        # Show percent + sizes inline so the visual matches GPU/VRAM/DISK.
+        # Percent gets the heat-mapped color; sizes stay neutral.
+        color = heat_pct(pct)
+        self._label.setTextFormat(Qt.TextFormat.RichText)
+        self._label.setText(
+            f"<span style='color:{color}; font-weight:bold;'>{int(round(pct))}%</span>"
+            f"  <span style='color:{MEDIUM};'>{gb(used):.1f}GB of {gb(total):.1f}GB</span>"
+        )
 
 
 class GpuView(QWidget):
@@ -431,14 +452,21 @@ class SystemView(QWidget):
 
 
 class DiskView(QWidget):
-    """Per-disk usage bars."""
+    """Per-disk usage bars with inline size info, mirroring the TUI:
+
+        C:  ▓▓▓▓▓▓▓▓░░░  74%   1.3TB of 1.8TB
+
+    `panel.disks` carries (label, kind, pct, used, total) — Phase-2 GUI
+    ported the bar but dropped used/total. This puts the size back.
+    """
     def __init__(self, panel, parent=None):
         super().__init__(parent)
         self.panel = panel
         self._lay = QVBoxLayout(self)
         self._lay.setContentsMargins(0, 0, 0, 0)
         self._lay.setSpacing(2)
-        self._rows = []  # list of (label, bar, pct_label) per disk
+        self._rows = []  # list of (label, bar, pct, size) per disk
+        self._stretch_added = False
 
     def refresh(self):
         from panels.base import fmt_bytes
@@ -455,24 +483,33 @@ class DiskView(QWidget):
             pct.setFont(_mono(9))
             pct.setFixedWidth(40)
             pct.setAlignment(Qt.AlignmentFlag.AlignRight)
+            size = QLabel("")
+            size.setFont(_mono(9))
+            size.setStyleSheet(f"color: {DIM};")
+            size.setMinimumWidth(110)
             row.addWidget(lbl)
             row.addWidget(bar, stretch=1)
             row.addWidget(pct)
+            row.addWidget(size)
             self._lay.addLayout(row)
-            self._rows.append((lbl, bar, pct))
+            self._rows.append((lbl, bar, pct, size))
+        if not self._stretch_added and self._rows:
+            self._lay.addStretch(1)
+            self._stretch_added = True
         # Hide extras if we got fewer disks than before.
-        for i, (lbl, bar, pct) in enumerate(self._rows):
+        for i, (lbl, bar, pct, size) in enumerate(self._rows):
             if i < len(disks):
                 label, kind, p, used, total = disks[i]
-                lbl.setText(f"<span style='color:{BRIGHT};'>{label}</span>")
-                lbl.setTextFormat(Qt.TextFormat.RichText)
-                bar.setValue(p)
                 color = heat_pct(p)
-                pct.setText(f"<span style='color:{color};'>{int(round(p))}%</span>")
+                lbl.setTextFormat(Qt.TextFormat.RichText)
+                lbl.setText(f"<span style='color:{BRIGHT};'>{label}</span>")
+                bar.setValue(p)
                 pct.setTextFormat(Qt.TextFormat.RichText)
-                lbl.show(); bar.show(); pct.show()
+                pct.setText(f"<span style='color:{color}; font-weight:bold;'>{int(round(p)):>3d}%</span>")
+                size.setText(f"{fmt_bytes(used)} of {fmt_bytes(total)}")
+                lbl.show(); bar.show(); pct.show(); size.show()
             else:
-                lbl.hide(); bar.hide(); pct.hide()
+                lbl.hide(); bar.hide(); pct.hide(); size.hide()
 
 
 class TempsView(QWidget):
@@ -488,6 +525,7 @@ class TempsView(QWidget):
         self._backend_lbl.setStyleSheet(f"color: {DIM};")
         self._lay.addWidget(self._backend_lbl)
         self._rows = []  # (label, bar, temp_label)
+        self._stretch_added = False
 
     def refresh(self):
         readings = getattr(self.panel, "readings", []) or []
@@ -512,6 +550,9 @@ class TempsView(QWidget):
             row.addWidget(tmp)
             self._lay.addLayout(row)
             self._rows.append((lbl, bar, tmp))
+        if not self._stretch_added and self._rows:
+            self._lay.addStretch(1)
+            self._stretch_added = True
 
         for i, (lbl, bar, tmp) in enumerate(self._rows):
             if i < len(readings):
@@ -995,22 +1036,32 @@ class WinstonGui(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(8, 6, 8, 6)
-        root.setSpacing(6)
+        root.setContentsMargins(6, 4, 6, 4)
+        root.setSpacing(4)
 
         self._status = StatusBarLabel()
         root.addWidget(self._status)
+
+        # ── Row sizing strategy ──
+        # Data panels use fixed-ish heights so the layout doesn't grow
+        # with the window. COMMENTARY is the one that absorbs all extra
+        # vertical space (it can hold many chat lines). Per row:
+        #   CPU LOAD   ~ 200 px (graph needs room)
+        #   row1       ~ 220 px (16 cores need vertical room)
+        #   row2       ~ 170 px (5 temp rows + GPU needs medium room)
+        #   row3       ~ 220 px (top-N processes table)
+        # Plus status / commentary / ask / footer which manage their own.
 
         # CPU LOAD — full-width
         self._cpu_graph = CpuGraphView(by_cls["CpuGraphPanel"])
         cpu_frame = PanelFrame("CPU LOAD")
         cpu_frame.body().addWidget(self._cpu_graph)
-        cpu_frame.setMinimumHeight(180)
+        cpu_frame.setFixedHeight(200)
         root.addWidget(cpu_frame)
 
         # ── Row 1: CORES (2fr) | MEMORY (1fr) | SYSTEM (1fr) ──
         row1 = QHBoxLayout()
-        row1.setSpacing(6)
+        row1.setSpacing(4)
 
         self._cores = CoresView(by_cls["CpuPanel"])
         cores_frame = PanelFrame("CORES")
@@ -1027,11 +1078,14 @@ class WinstonGui(QMainWindow):
         sys_frame.body().addWidget(self._system)
         row1.addWidget(sys_frame, stretch=1)
 
-        root.addLayout(row1, stretch=2)
+        row1_container = QWidget()
+        row1_container.setLayout(row1)
+        row1_container.setFixedHeight(220)
+        root.addWidget(row1_container)
 
         # ── Row 2: DISK (1fr) | TEMPS (2fr) | GPU (2fr) ──
         row2 = QHBoxLayout()
-        row2.setSpacing(6)
+        row2.setSpacing(4)
 
         self._disk = DiskView(by_cls["DiskPanel"])
         disk_frame = PanelFrame("DISK")
@@ -1048,11 +1102,14 @@ class WinstonGui(QMainWindow):
         gpu_frame.body().addWidget(self._gpu)
         row2.addWidget(gpu_frame, stretch=2)
 
-        root.addLayout(row2, stretch=2)
+        row2_container = QWidget()
+        row2_container.setLayout(row2)
+        row2_container.setFixedHeight(170)
+        root.addWidget(row2_container)
 
         # ── Row 3: NETWORK (1fr) | PROCESSES (2fr) ──
         row3 = QHBoxLayout()
-        row3.setSpacing(6)
+        row3.setSpacing(4)
 
         self._network = NetworkView(by_cls["NetworkPanel"])
         net_frame = PanelFrame("NETWORK")
@@ -1064,9 +1121,12 @@ class WinstonGui(QMainWindow):
         proc_frame.body().addWidget(self._processes)
         row3.addWidget(proc_frame, stretch=2)
 
-        root.addLayout(row3, stretch=2)
+        row3_container = QWidget()
+        row3_container.setLayout(row3)
+        row3_container.setFixedHeight(220)
+        root.addWidget(row3_container)
 
-        # ── COMMENTARY (LLM streaming) ──
+        # ── COMMENTARY (LLM streaming) — absorbs leftover vertical ──
         # Reuses brain.client / brain.prompt / brain.memory unchanged. The
         # CommentaryView wraps the same state machine we have in the TUI;
         # only the renderer differs.
@@ -1077,8 +1137,8 @@ class WinstonGui(QMainWindow):
         )
         commentary_frame = PanelFrame("COMMENTARY")
         commentary_frame.body().addWidget(self._commentary)
-        commentary_frame.setMinimumHeight(140)
-        root.addWidget(commentary_frame, stretch=2)
+        commentary_frame.setMinimumHeight(120)
+        root.addWidget(commentary_frame, stretch=1)
 
         # ── ASK input ──
         # Press `/` from anywhere to focus (matches the TUI binding).
