@@ -106,6 +106,21 @@ Anything that takes more than ~5 ms must run on a daemon thread. The UI panel ju
 
 The typewriter (25 Hz) and cursor blink (2.5 Hz) timers are only scheduled while a stream is in flight. Idle Winston has zero CommentaryPanel timers running.
 
+### Two frontends, one orchestrator
+
+Winston ships two frontends — `cli/display.py` (Textual TUI, default) and `gui/main.py` (PyQt6 desktop, `--gui`) — and the LLM commentary logic lives in **neither**. It lives in `brain/commentary_engine.py:CommentaryEngine`, which owns:
+
+- The state machine (THINKING / STREAMING / IDLE / ERROR / DISABLED)
+- Q&A history + multi-turn context (last 3 pairs)
+- Streaming buffer + typewriter cursor advancement
+- Trigger evaluation (the 7 triggers in `brain/triggers.py` plus the 1Hz busy-gate / heartbeat / stale-quiet rules)
+- Prompt-building dispatch (`build_greeting / build_retrospective / build_triggered / build_observation / build_conversational`)
+- Model tier selection
+
+Each frontend is a thin renderer + timer driver that calls into the engine. Adding a third frontend (web, mobile) just means writing another renderer — no LLM logic to duplicate.
+
+Why this matters: when we first added the GUI, the trigger evaluation got duplicated and rules drifted between frontends. Extracting into the engine fixed both copies at once and means future trigger / heartbeat tweaks live in one place.
+
 ### Investigation: NetworkPanel and dropped keystrokes
 
 This bug took a while to find — keeping the writeup short here, but it's worth knowing why `NETWORK` polls so slowly.
@@ -174,35 +189,48 @@ ollama pull qwen2.5:7b-instruct
 ## Project layout
 
 ```
-winston.py              # entry point — small, just imports + section list + run()
-config.py               # all tunables (FRAME_HZ, panel hz, LLM, triggers, thresholds)
-display.py              # Textual app, layout CSS, master frame loop, CpuGraphWidget
+winston.py              # entry point — picks frontend via --gui flag
+config.py               # all tunables (FRAME_HZ, GPU_BUSY_*, panel hz, LLM, triggers)
 theme.py                # color decisions: heat_pct() / heat_temp() helpers
 logger.py               # 1 Hz CSV writer
 input_test.py           # standalone Textual harness for input-drop debugging
-panels/
+
+panels/                 # data layer — SHARED across frontends
   base.py               # bar gauges, braille graph, fmt_bytes
-  cpu_graph.py          # data class — display.py builds the graph widget
+  cpu_graph.py          # CPU-history data class
   cpu.py · ram.py · system.py · disk.py · processes.py
   temps.py              # multi-backend (native/LHM/WMI), smart device labels
-  gpu.py                # pynvml/nvidia-smi + LHM enrichment, polled on its own thread
-  network.py            # PowerShell host stats (5 s poll), smoothed rates, peak tracking
+  gpu.py                # pynvml/nvidia-smi + LHM enrichment, own poll thread
+  network.py            # PowerShell host stats (5 s poll), smoothed, peak-tracked
   lhm.py                # shared LHM HTTP poller (background thread, single cache)
-  brain.py              # BRAIN panel — visualizes Winston's internal LLM state
-brain/
+  brain.py              # BRAIN panel data class (rendered by both frontends)
+
+brain/                  # LLM layer — SHARED across frontends
   client.py             # Ollama client; FIFO worker thread
-  prompt.py             # observation/greeting/retrospective/triggered/conversational builders
+  prompt.py             # all prompt builders
   baselines.py          # rolling mean/stddev for anomaly detection
-  triggers.py           # event-driven commentary
+  triggers.py           # the 7 trigger functions + TriggerRunner
   history.py            # single-pass O(n) CSV scanner
   memory.py             # persistent JSON-backed user memory
-ui/ask.py               # legacy modal popup (not currently wired)
+  commentary_engine.py  # backend-agnostic orchestrator — state machine,
+                        # trigger evaluation, heartbeat, stale-quiet,
+                        # Q&A history. Both frontends consume this.
+
+cli/                    # TUI frontend — only renders engine state
+  display.py            # Textual app + CommentaryPanel renderer
+  ui/ask.py             # legacy modal popup (not currently wired)
+
+gui/                    # desktop frontend — only renders engine state
+  main.py               # PyQt6 + pyqtgraph; QMainWindow + view widgets
+
 logs/
   raw/observations.csv  # 1 row/sec — gitignored
   memory.json           # Winston's persistent memory — gitignored
 ```
 
-**Adding a panel:** drop a class in `panels/` with `update()`, `render(width=None)`, `csv_headers()`, `csv_columns()`. Add it to the section list in `winston.py` and a layout slot in `display.py`.
+**Adding a panel:** drop a class in `panels/` with `update()`, `render(width=None)`, `csv_headers()`, `csv_columns()`. Add it to the section list in `winston.py` and a layout slot in BOTH `cli/display.py` (`compose()`) and `gui/main.py` (`WinstonGui.__init__` row layout). The data class is shared.
+
+**Adding a trigger:** write a function in `brain/triggers.py` taking `(sections, baselines, cfg)` and returning a `TriggerEvent` or `None`. Register it in `TRIGGER_FUNCTIONS` and add a config block in `config.py:TRIGGERS`. Both frontends pick it up automatically — the engine evaluates all registered triggers at 1 Hz.
 
 **Adding anything that does I/O, subprocess, or syscalls:** put the slow work on a daemon thread. UI panel reads from a lock-guarded cache. See [the 5 ms rule](#the-5-ms-rule-heavy-work-goes-on-a-thread).
 

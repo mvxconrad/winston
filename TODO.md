@@ -165,6 +165,42 @@ Done in v0.8.1.
 - [ ] BRAIN panel shows which model is actually loaded right now
       (already does — verify it updates correctly across tier switches)
 
+### 3B accuracy / awareness pass
+The 3B will confabulate when given ambiguous state. Real example from a
+heartbeat that fired during `yes > /dev/null`:
+
+> Yes is thrashing heavily; cores have been maxed for a minute now.
+> Python3 idle but using some CPU and memory. RAM and temps are elevated.
+> Network performance inconsistent. System under heavy load with no
+> immediate relief in sight.
+
+Wrong claims in that one paragraph:
+- "Python3 idle but using some CPU" — contradiction
+- "RAM elevated" — was at 11%
+- "Temps elevated" — were normal (CPU 60°C, GPU 54°C)
+- "Network inconsistent" — no evidence in the snapshot
+- "no immediate relief in sight" — overdramatic for one `yes` process
+
+Cause: the 3B pattern-matches "high CPU = generally bad system" and fills
+in plausible-sounding details that aren't in the data.
+
+Fixes to try:
+- [ ] Tighten the system prompt: "Comment ONLY on metrics you can read in
+      the snapshot. Do NOT speculate about things not shown. If RAM /
+      temps / network are normal, do not mention them."
+- [ ] Pre-classify the snapshot in code (in `brain/prompt.py`):
+      tag each metric as `low / normal / elevated / critical` so the
+      model has labels rather than raw numbers to interpret.
+- [ ] Drop metrics from the prompt that aren't relevant to the trigger.
+      A `single_core_pegged` trigger only needs CPU details — leave
+      RAM / network / temps out so the model can't confabulate about them.
+- [ ] Few-shot examples in the system prompt: 1-2 good examples + 1 bad
+      example with explicit "this is what NOT to do."
+- [ ] Add a `verify` pass for `notable`-tier+ events: after the 3B
+      generates, run a small check (regex / token contains "elevated"
+      with a metric that's actually normal) and either edit or
+      re-prompt. Probably overkill for now.
+
 ### Tools Winston asked for
 He literally requested these when asked what would help him do his job
 better. Reasonable Tier 1 (read-only) ideas to add to Stage 5.6:

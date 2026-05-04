@@ -57,21 +57,19 @@ class FooterBar(Static):
 
 
 class CommentaryPanel(Static):
-    """LLM-powered commentary panel — chat-log style with typewriter.
+    """Textual frontend for `brain.commentary_engine.CommentaryEngine`.
 
-    Shows a scrolling history of messages; older messages stay visible
-    above the newest, fading in brightness. Uses a typewriter buffer to
-    decouple LLM generation speed from display speed: tokens arrive fast,
-    panel emits them at config['typewriter_tps'] for a more deliberate feel.
+    All orchestration logic — state machine, Q&A history, trigger
+    evaluation, heartbeat / stale-quiet, prompt building, model tiering —
+    lives in the engine. This class only does:
+      - Render engine state into Rich markup via `self.update(...)`
+      - Drive Textual timers (typewriter, cursor blink, 1Hz triggers)
+      - Marshal stream chunks from worker thread → engine via
+        `app.call_from_thread`
+      - Translate engine "fire this prompt" results into actual
+        `generate_stream_async` calls
 
-    On startup (if config['startup_greeting']):
-      1. Greeting: "Good morning, max."
-      2. Retrospective: brief comment on last 24h of logs
-      3. Begin regular commentary loop
-
-    Threading: LLM worker runs on its own thread (brain.client) and fires
-    callbacks from THAT thread. We use Textual's call_from_thread() to
-    bounce state mutations to the UI thread.
+    Same engine is shared with the PyQt6 GUI in gui/main.py.
     """
 
     # Cursor blink rate while streaming
@@ -79,108 +77,48 @@ class CommentaryPanel(Static):
 
     def __init__(self, sections=None, config=None, memory=None, **kwargs):
         super().__init__(**kwargs)
-        self._sections = sections or []
-        self._config = config or {"enabled": False}
-        # Optional Memory instance. When present, all prompts get the
-        # personality block and per-process behavior fingerprints.
-        self._memory = memory
-
-        # Chat-log history: list of (timestamp_str, message, kind) tuples.
-        # kind is "winston" (LLM output) or "user" (user question).
-        # Capped at config['lines'] - 1 (one slot reserved for streaming).
-        self._history = []
-        self._max_history = max(1, self._config.get("lines", 5)) - 1
-
-        # Q&A history for multi-turn context (separate from display history).
-        # List of (user_question, winston_answer) pairs. Last 3 fed back to
-        # the LLM as context so follow-ups make sense.
-        self._qa_history = []
-        # The user question that's currently being answered (so when the
-        # answer streams in, we know to record the pair into _qa_history)
-        self._pending_user_question = None
-
-        # Typewriter machinery — same as before
-        self._streaming_buffer = ""
-        self._typed_chars = 0
-        self._stream_complete = False
-
-        # Possible states: THINKING, STREAMING, IDLE, ERROR, DISABLED
-        if self._config.get("enabled", False):
-            self._state = "THINKING"
-        else:
-            self._state = "DISABLED"
-
+        from brain.commentary_engine import CommentaryEngine
+        self.engine = CommentaryEngine(sections or [], config or {}, memory)
         self._cursor_visible = True
-        self._startup_step = None
-        self._cooldown_active = False
-
-        # Last trigger event that fired (for the BrainPanel to display).
-        # Tuple of (name, severity, time-str) or None.
-        self._last_event = None
-
-    # ──────────────── Read-only accessors (for BrainPanel) ────────
-    def get_state(self):
-        return self._state
-
-    def get_last_event(self):
-        return self._last_event
-
-    # ──────────────── Model tier selection ────────────────
-    def _pick_model(self, tier):
-        """Returns (model_name, keep_alive) for the given tier.
-
-        tier: "fast" | "quality"
-        When LLM_USE_TIERED is False, both tiers fall back to single-model
-        with keep_alive=-1 (resident forever).
-        """
-        cfg = self._config
-        if not cfg.get("use_tiered", False):
-            return cfg.get("model"), -1
-        if tier == "quality":
-            return (cfg.get("model_quality") or cfg.get("model"),
-                    cfg.get("quality_keep_alive_sec", 0))
-        return (cfg.get("model_fast") or cfg.get("model"),
-                cfg.get("fast_keep_alive_sec", 0))
-
-    # ──────────────── Lifecycle ────────────────
-    def on_mount(self):
-        if not self._config.get("enabled", False):
-            self._paint()
-            return
-
-        # Cursor blink + typewriter intervals are STARTED LAZILY in
-        # _begin_streaming() and STOPPED in _finalize_message(). We don't
-        # schedule them here at mount time. Reason: the typewriter ticks
-        # at 25Hz and the blinker at 2.5Hz, but both are no-ops while
-        # idle. Even an empty asyncio callback at 25Hz competes with the
-        # input widget's keystroke processing — the dashboard has plenty
-        # of other timers (panels, logger, triggers) and one more high-
-        # frequency one was enough to drop ~10% of typed characters in
-        # the ASK input. Holding the timers off until there's actually
-        # something to type out keeps the loop quiet between messages.
+        # Lazy stream timers — nothing scheduled until a stream starts.
         self._cursor_timer = None
         self._typewriter_timer = None
 
-        # Begin startup sequence (if enabled), else jump to regular loop
-        if self._config.get("startup_greeting", True):
-            self._startup_step = "greeting"
-            self._trigger_greeting()
+    # ──────────────── Read-only accessors (for BrainPanel) ────────
+    def get_state(self):
+        return self.engine.state
+
+    def get_last_event(self):
+        return self.engine.last_event
+
+    # ──────────────── Lifecycle ────────────────
+    def on_mount(self):
+        if not self.engine.config.get("enabled", False):
+            self._paint()
+            return
+        if self.engine.config.get("startup_greeting", True):
+            self.engine.startup_step = "greeting"
+            self._fire_step("greeting")
         else:
             self._begin_regular_loop()
         self._paint()
 
+    # ──────────────── Stream timer machinery ────────────────
+    # Why lazy: the typewriter ticks at 25Hz and the blinker at 2.5Hz, but
+    # both are no-ops while idle. Even an empty asyncio callback at 25Hz
+    # was enough to drop ~10% of typed characters in the ASK input when
+    # combined with all the other dashboard timers. Holding the timers off
+    # until there's actually something to type out keeps the loop quiet.
     def _start_stream_timers(self):
-        """Schedule cursor blink + typewriter ticks. Idempotent."""
         if self._cursor_timer is None:
             self._cursor_timer = self.set_interval(
                 1.0 / self.CURSOR_BLINK_HZ, self._toggle_cursor)
         if self._typewriter_timer is None:
-            tps = self._config.get("typewriter_tps", 25)
+            tps = self.engine.config.get("typewriter_tps", 25)
             self._typewriter_timer = self.set_interval(
                 1.0 / tps, self._typewriter_tick)
 
     def _stop_stream_timers(self):
-        """Tear down cursor blink + typewriter ticks. Idempotent."""
         if self._cursor_timer is not None:
             try:
                 self._cursor_timer.stop()
@@ -194,413 +132,168 @@ class CommentaryPanel(Static):
                 pass
             self._typewriter_timer = None
 
-    # ──────────────── Startup sequence ────────────────
-    def _trigger_greeting(self):
+    # ──────────────── Stream firing (uses engine for prompts) ─────
+    def _fire_stream(self, system, prompt, tier):
+        """Common path for every LLM call. Engine begins the stream;
+        we hand brain.client our marshaling callbacks."""
         from brain.client import generate_stream_async
-        from brain.prompt import build_greeting_prompt
-
-        try:
-            system, user = build_greeting_prompt(
-                user_name=self._config.get("user_name"),
-                memory=self._memory,
-            )
-        except Exception:
-            self._on_startup_step_done()
-            return
-
-        self._begin_streaming()
-        # Greeting uses fast (3B) — same reasoning as triggered events.
-        # Quality (7B) is reserved for user questions only, where the user
-        # explicitly waited for an answer. Ambient ritual shouldn't pop the
-        # 7B into VRAM if the user is mid-game.
-        model, keep_alive = self._pick_model("fast")
+        self.engine.begin_streaming()
+        self._start_stream_timers()
+        self._paint()
+        model, keep_alive = self.engine.pick_model(tier)
         generate_stream_async(
-            user, system=system, model=model, keep_alive=keep_alive,
+            prompt, system=system, model=model, keep_alive=keep_alive,
             on_chunk=self._on_chunk_worker,
-            on_done=self._on_startup_done_worker,
-            on_error=self._on_startup_error_worker,
+            on_done=self._on_done_worker,
+            on_error=self._on_error_worker,
         )
 
-    def _trigger_retrospective(self):
-        from brain.prompt import build_retrospective_prompt
-        from brain.history import summarize_recent
-
-        try:
-            stats = summarize_recent(hours=24)
-            system, user = build_retrospective_prompt(stats)
-        except Exception:
+    def _fire_step(self, step):
+        """Fire whichever startup step we're on."""
+        if step == "greeting":
+            system, prompt, tier = self.engine.build_greeting()
+        else:  # retrospective
+            system, prompt, tier = self.engine.build_retrospective()
+        if system is None:
             self._on_startup_step_done()
             return
-
-        if system is None or user is None:
-            self._on_startup_step_done()
-            return
-
-        # Wait the inter-message pause before starting next message
-        pause = self._config.get("inter_message_pause_sec", 2.0)
-        self.set_timer(pause, lambda: self._begin_retrospective_call(system, user))
-
-    def _begin_retrospective_call(self, system, user):
-        from brain.client import generate_stream_async
-        self._begin_streaming()
-        # Retrospective uses fast (3B). Same reasoning as greeting — startup
-        # ritual shouldn't pop the 7B into VRAM during a gaming session.
-        model, keep_alive = self._pick_model("fast")
-        generate_stream_async(
-            user, system=system, model=model, keep_alive=keep_alive,
-            on_chunk=self._on_chunk_worker,
-            on_done=self._on_startup_done_worker,
-            on_error=self._on_startup_error_worker,
-        )
-
-    def _on_startup_step_done(self):
-        if self._startup_step == "greeting":
-            self._startup_step = "retrospective"
-            self._trigger_retrospective()
-        elif self._startup_step == "retrospective":
-            self._startup_step = None
-            pause = self._config.get("inter_message_pause_sec", 2.0)
-            self.set_timer(pause, self._begin_regular_loop)
+        self._fire_stream(system, prompt, tier)
 
     def _begin_regular_loop(self):
-        """Start the trigger-driven commentary loop.
-
-        Two timers:
-          1. 1Hz trigger tick — pushes baselines, evaluates triggers, fires
-             commentary if a trigger says so.
-          2. Heartbeat — every config['heartbeat_interval_sec'] seconds,
-             fires a routine commentary regardless. Reassures the user
-             Winston is alive even when nothing's happening.
-        """
-        from brain.triggers import TriggerRunner
-        self._trigger_runner = TriggerRunner(self._config.get("triggers", {}))
-        # Time of last commentary firing (any kind — trigger, heartbeat, user)
-        # Used by the stale-quiet check.
-        import time
-        self._last_fire_time = time.monotonic()
-        # When the last heartbeat fired (separate from _last_fire_time
-        # because user input/triggers don't reset the heartbeat clock —
-        # we still want one ~5min after launch even if you've been busy).
-        self._last_heartbeat_time = time.monotonic()
-
-        # 1Hz tick: evaluate triggers
+        """Init the trigger runner, fire one routine, start the 1Hz tick."""
+        self.engine.startup_step = None
+        self.engine.init_triggers()
+        # Fire one observation as the "startup commentary".
+        system, prompt, tier = self.engine.build_observation()
+        if system is not None:
+            self._fire_stream(system, prompt, tier)
+        # 1Hz trigger tick
         self.set_interval(1.0, self._tick_triggers)
 
-        # Fire one routine commentary right away so the panel has fresh
-        # content as soon as startup ritual is done
-        self._trigger_routine("startup commentary")
-
-    # ──────────────── Trigger-driven loop ────────────────
+    # ──────────────── 1Hz trigger tick ────────────────
     def _tick_triggers(self):
-        """Called every second. Updates baselines, checks for events,
-        fires commentary if appropriate."""
         import time
         _t0 = time.monotonic()
         try:
-            self._tick_triggers_inner()
+            result = self.engine.evaluate_triggers()
+            if result is not None:
+                kind, payload = result
+                if kind == "event":
+                    system, prompt, tier = self.engine.build_triggered(payload)
+                else:  # heartbeat / stale → routine observation
+                    system, prompt, tier = self.engine.build_observation()
+                if system is not None:
+                    self._fire_stream(system, prompt, tier)
         finally:
             try:
                 self.app._record_timing("CommentaryPanel.triggers", _t0)
             except Exception:
                 pass
 
-    def _tick_triggers_inner(self):
-        import time
-        now = time.monotonic()
-
-        # Always update baselines, even if we're streaming. Baselines should
-        # reflect actual ongoing state, not only when we're idle.
-        try:
-            event = self._trigger_runner.tick(self._sections)
-        except Exception:
-            event = None
-
-        # If we're currently streaming, the only thing that should preempt
-        # is an `alert`-tier event. Notable preempts routine but we don't
-        # know if the current stream is routine or notable here, so we
-        # play it conservative: only alerts preempt. (Stage 5.5 may revisit.)
-        is_busy = self._state in ("STREAMING", "THINKING") or self._cooldown_active
-
-        if event is not None:
-            if is_busy and event.severity != "alert":
-                return  # let current message finish; this trigger's cooldown
-                        # already started so it won't fire again immediately
-            self._trigger_event(event)
-            self._last_fire_time = now
+    # ──────────────── User question ────────────────
+    def ask_user(self, question):
+        """Route a user question through the engine + fire conversational
+        prompt (quality tier)."""
+        recorded = self.engine.handle_user_question(question)
+        if recorded is None:
             return
-
-        # No event fired. Check if it's time for a heartbeat.
-        if is_busy:
-            return
-
-        heartbeat_interval = self._config.get("heartbeat_interval_sec", 300)
-        if heartbeat_interval > 0 and (now - self._last_heartbeat_time) >= heartbeat_interval:
-            self._last_heartbeat_time = now
-            self._last_fire_time = now
-            self._trigger_routine("heartbeat")
-            return
-
-        # Stale check — nothing's happened in a long time at all
-        stale = self._config.get("stale_quiet_threshold_sec", 900)
-        if stale > 0 and (now - self._last_fire_time) >= stale:
-            self._last_fire_time = now
-            self._trigger_routine("stale quiet")
-
-    def _trigger_event(self, event):
-        """Fire commentary for a specific trigger event."""
-        from brain.client import generate_stream_async
-        from brain.prompt import build_triggered_prompt
-        from datetime import datetime
-
-        try:
-            system, user = build_triggered_prompt(self._sections, event,
-                                                  memory=self._memory)
-        except Exception:
-            return
-
-        # Stash for the BrainPanel
-        self._last_event = (event.name, event.severity,
-                            datetime.now().strftime("%H:%M:%S"))
-
-        self._begin_streaming()
-        # All triggered events use the fast model. Alerts USED to use quality
-        # for nuance, but that pops the 7B back into VRAM at the worst possible
-        # moment (something just went wrong → GPU spike → game stutters → 7B
-        # loads). The 3B's observation is plenty for "GPU at 92°C" or "RAM
-        # nearly full." Quality stays reserved for greeting / retrospective /
-        # user-asked questions, where the user has time to wait.
-        model, keep_alive = self._pick_model("fast")
-        generate_stream_async(
-            user, system=system, model=model, keep_alive=keep_alive,
-            on_chunk=self._on_chunk_worker,
-            on_done=self._on_done_worker,
-            on_error=self._on_error_worker,
-        )
-
-    def _trigger_routine(self, _reason):
-        """Fire a routine commentary (heartbeat / stale / startup)."""
-        from brain.client import generate_stream_async
-        from brain.prompt import build_observation_prompt
-
-        try:
-            system, user = build_observation_prompt(self._sections,
-                                                    memory=self._memory)
-        except Exception:
-            self._state = "ERROR"
+        system, prompt, tier = self.engine.build_conversational(recorded)
+        if system is None:
+            self.engine.state = "ERROR"
             self._paint()
             return
+        self._fire_stream(system, prompt, tier)
 
-        self._begin_streaming()
-        model, keep_alive = self._pick_model("fast")
-        generate_stream_async(
-            user, system=system, model=model, keep_alive=keep_alive,
-            on_chunk=self._on_chunk_worker,
-            on_done=self._on_done_worker,
-            on_error=self._on_error_worker,
-        )
-
-    # ──────────────── Streaming + typewriter ────────────────
-    def _begin_streaming(self):
-        """Reset state for a fresh LLM call."""
-        self._streaming_buffer = ""
-        self._typed_chars = 0
-        self._stream_complete = False
-        self._state = "THINKING"
-        self._start_stream_timers()
-        self._paint()
-
+    # ──────────────── Typewriter / cursor ────────────────
     def _typewriter_tick(self):
-        """Advance the typewriter cursor by one character if there's more to show."""
-        if self._typed_chars < len(self._streaming_buffer):
-            self._typed_chars += 1
+        result = self.engine.typewriter_advance()
+        if result == "advanced":
             self._paint()
-        elif self._stream_complete and self._state != "IDLE":
-            # All tokens received AND all chars shown — message is fully done
-            self._finalize_message()
-
-    def _finalize_message(self):
-        """Move the just-finished streaming message into history."""
-        msg = self._streaming_buffer.strip()
-        if msg:
-            from datetime import datetime
-            ts = datetime.now().strftime("%H:%M:%S")
-            self._history.append((ts, msg, "winston"))
-            # Trim history to max
-            if len(self._history) > self._max_history:
-                self._history = self._history[-self._max_history:]
-
-            # If this answered a user question, record the pair for multi-turn
-            if self._pending_user_question is not None:
-                self._qa_history.append((self._pending_user_question, msg))
-                # Cap Q&A history at last 5 (we only feed back last 3 anyway)
-                if len(self._qa_history) > 5:
-                    self._qa_history = self._qa_history[-5:]
-                self._pending_user_question = None
-
-        self._streaming_buffer = ""
-        self._typed_chars = 0
-        self._stream_complete = False
-        self._state = "IDLE"
-        self._cooldown_active = True
-        # Stop the per-stream timers so the asyncio loop is quiet again
-        # while we're idle — keeps the ASK input keystrokes responsive.
-        self._stop_stream_timers()
-        self._paint()
-
-        # Cooldown: after the inter-message pause, allow next message to start
-        pause = self._config.get("inter_message_pause_sec", 2.0)
-        self.set_timer(pause, self._end_cooldown)
+        elif result == "finalize":
+            self._stop_stream_timers()
+            self._paint()
+            # Cooldown: after the inter-message pause, end cooldown so the
+            # next message can start. If we were in the startup ritual,
+            # advance to the next step at the same time.
+            pause = self.engine.config.get("inter_message_pause_sec", 2.0)
+            self.set_timer(pause, self._end_cooldown)
 
     def _end_cooldown(self):
-        self._cooldown_active = False
-        # If this was a startup step, advance to the next one now
-        if self._startup_step is not None:
+        self.engine.end_cooldown()
+        if self.engine.startup_step is not None:
             self._on_startup_step_done()
 
-    # ──────────────── User question handler ────────────────
-    def ask_user(self, question):
-        """Handle a user question typed into the conversational input.
+    def _on_startup_step_done(self):
+        if self.engine.startup_step == "greeting":
+            self.engine.startup_step = "retrospective"
+            pause = self.engine.config.get("inter_message_pause_sec", 2.0)
+            self.set_timer(pause, lambda: self._fire_step("retrospective"))
+        else:
+            pause = self.engine.config.get("inter_message_pause_sec", 2.0)
+            self.set_timer(pause, self._begin_regular_loop)
 
-        Preempts whatever is currently streaming (user's question is alert-
-        tier — they're waiting for an answer). Adds the question to the chat
-        log, then fires an LLM call with current state + Q&A history as
-        context.
-        """
-        if not self._config.get("enabled", False):
-            return
-        if not question or not question.strip():
-            return
-
-        from brain.client import generate_stream_async
-        from brain.prompt import build_conversational_prompt
-        from datetime import datetime
-
-        # If something's mid-stream, finalize it abruptly so the chat log
-        # doesn't lose the partial message. This is the simplest race-
-        # condition handling — Stage 5.5 will replace this with proper
-        # tier-based preemption.
-        if self._state == "STREAMING":
-            # Force-finalize what's been typed so far
-            self._typed_chars = len(self._streaming_buffer)
-            self._finalize_message()
-            self._cooldown_active = False  # don't make user wait through cooldown
-
-        # Add the user's question to the chat log
-        ts = datetime.now().strftime("%H:%M:%S")
-        self._history.append((ts, question.strip(), "user"))
-        if len(self._history) > self._max_history:
-            self._history = self._history[-self._max_history:]
-
-        # Build prompt with snapshot + multi-turn context + the question
-        try:
-            system, user_prompt = build_conversational_prompt(
-                self._sections, question.strip(), history=self._qa_history,
-                memory=self._memory,
-            )
-        except Exception:
-            self._state = "ERROR"
+    def _toggle_cursor(self):
+        if self.engine.state in ("STREAMING", "THINKING"):
+            self._cursor_visible = not self._cursor_visible
             self._paint()
-            return
-
-        # Track the pending question so we can pair it with the answer
-        self._pending_user_question = question.strip()
-
-        self._begin_streaming()
-        model, keep_alive = self._pick_model("quality")
-        generate_stream_async(
-            user_prompt, system=system, model=model, keep_alive=keep_alive,
-            on_chunk=self._on_chunk_worker,
-            on_done=self._on_done_worker,
-            on_error=self._on_error_worker,
-        )
 
     # ──────────────── Worker-thread callbacks ────────────────
-    # Fire from the LLM worker thread; we marshal back to UI thread.
+    # Stream callbacks fire from brain.client's worker thread. We marshal
+    # to the UI thread before mutating engine state so the engine never
+    # has to think about threading.
     def _on_chunk_worker(self, chunk):
         self.app.call_from_thread(self._on_chunk, chunk)
 
-    def _on_done_worker(self, _full_text):
-        self.app.call_from_thread(self._on_done)
+    def _on_done_worker(self, full_text):
+        self.app.call_from_thread(self._on_done, full_text)
 
     def _on_error_worker(self):
         self.app.call_from_thread(self._on_error)
 
-    def _on_startup_done_worker(self, _full_text):
-        self.app.call_from_thread(self._on_done)
-
-    def _on_startup_error_worker(self):
-        self.app.call_from_thread(self._on_startup_error)
-
-    # ──────────────── UI-thread state updates ────────────────
+    # ──────────────── UI-thread slots ────────────────
     def _on_chunk(self, chunk):
-        if self._state == "THINKING":
-            self._state = "STREAMING"
-        self._streaming_buffer += chunk
-        # Don't update _typed_chars here — let the typewriter tick advance it
+        self.engine.on_chunk(chunk)
         self._paint()
 
-    def _on_done(self):
-        # LLM is done generating, but typewriter may still be catching up.
-        # Mark stream complete; _typewriter_tick will call _finalize_message
-        # once it's caught up to the buffer length.
-        self._stream_complete = True
+    def _on_done(self, full_text):
+        self.engine.on_done(full_text)
 
     def _on_error(self):
-        self._state = "ERROR"
-        # Error short-circuits the stream — make sure we tear the timers
-        # down here too, otherwise they keep firing in the ERROR state.
+        self.engine.on_error()
         self._stop_stream_timers()
         self._paint()
-        # Still treat as a finished step so startup can advance
-        if self._startup_step is not None:
-            self._cooldown_active = True
-            pause = self._config.get("inter_message_pause_sec", 2.0)
-            self.set_timer(pause, self._end_cooldown)
-
-    def _on_startup_error(self):
-        self._on_error()
+        # If the failing call was part of the startup ritual, advance
+        # anyway so the rest of the ritual can run.
+        if self.engine.startup_step is not None:
+            pause = self.engine.config.get("inter_message_pause_sec", 2.0)
+            self.set_timer(pause, self._on_startup_step_done)
 
     # ──────────────── Rendering ────────────────
-    def _toggle_cursor(self):
-        if self._state in ("STREAMING", "THINKING"):
-            self._cursor_visible = not self._cursor_visible
-            self._paint()
-
     def _paint(self):
-        """Render the history + currently-streaming message."""
-        if self._state == "DISABLED":
+        """Render engine state into Rich markup."""
+        e = self.engine
+        if e.state == "DISABLED":
             self.update("[bold bright_green]>[/bold bright_green] "
                         "[grey50]analysis subsystem :: disabled[/grey50] "
-                        "[grey50](LLM_ENABLED = False in winston.py)[/grey50]")
+                        "[grey50](LLM_ENABLED = False in config.py)[/grey50]")
             return
 
-        lines = []
-
-        # Color fade for older messages — newest gets bright green, each
-        # older line steps down through medium green, dim green, to grey.
-        # The fade tells the eye where "now" is at a glance.
+        # Newest gets bright green, older steps through medium → dim → grey.
         FADE_PALETTE = ["bright_green", "#3aa83a", "#1a8c1a", "#0a5a0a", "grey50"]
 
-        history_count = len(self._history)
-        for idx, entry in enumerate(self._history):
-            # Tolerate old (ts, msg) format if it slipped in
+        lines = []
+        history_count = len(e.history)
+        for idx, entry in enumerate(e.history):
             if len(entry) == 3:
                 ts, msg, kind = entry
             else:
                 ts, msg = entry
                 kind = "winston"
             safe = msg.replace("[", r"\[")
-
-            # Distance from the end determines fade depth.
-            # The newest history entry (idx == count-1) gets the second-
-            # brightest color (because position 0 of the palette is reserved
-            # for the actively-streaming line).
             distance_from_end = (history_count - 1) - idx
             color = FADE_PALETTE[min(distance_from_end + 1, len(FADE_PALETTE) - 1)]
 
             if kind == "user":
-                # User lines: keep the cyan accent, fade the body to grey
-                # at the same rate as winston lines.
                 lines.append(f"[grey50]{ts}[/grey50]  "
                              f"[bold bright_cyan]?[/bold bright_cyan] "
                              f"[#3a8a9c]{safe}[/#3a8a9c]")
@@ -609,24 +302,23 @@ class CommentaryPanel(Static):
                              f"[bold {color}]>[/bold {color}] "
                              f"[{color}]{safe}[/{color}]")
 
-        # Current streaming line — always rendered in the brightest green
-        if self._state == "THINKING":
+        if e.state == "THINKING":
             cursor = "█" if self._cursor_visible else " "
             lines.append(f"[grey50]--:--:--[/grey50]  "
                          f"[bold bright_green]>[/bold bright_green] "
                          f"[grey50]thinking…[/grey50] "
                          f"[bright_green]{cursor}[/bright_green]")
-        elif self._state == "STREAMING":
+        elif e.state == "STREAMING":
             from datetime import datetime
             ts = datetime.now().strftime("%H:%M:%S")
-            visible = self._streaming_buffer[:self._typed_chars]
+            visible = e.streaming_buffer[:e.typed_chars]
             safe = visible.replace("[", r"\[")
             cursor = "█" if self._cursor_visible else " "
             lines.append(f"[grey50]{ts}[/grey50]  "
                          f"[bold bright_green]>[/bold bright_green] "
                          f"[bright_green]{safe}[/bright_green]"
                          f"[bright_green]{cursor}[/bright_green]")
-        elif self._state == "ERROR":
+        elif e.state == "ERROR":
             lines.append(f"[grey50]--:--:--[/grey50]  "
                          f"[bold bright_green]>[/bold bright_green] "
                          f"[red]analysis error[/red] "
