@@ -8,8 +8,15 @@ All tunable behavior — refresh rates, LLM settings, trigger thresholds —
 lives in config.py. Edit there to change Winston's behavior. Edit here
 when you're adding or removing a panel.
 
-To launch:  python3 winston.py
+Two frontends share this entry point:
+  python3 winston.py           → terminal UI (cli/display.py)
+  python3 winston.py --gui     → desktop app (gui/main.py)
+
+The data layer (panels/, brain/, theme.py, config.py, logger.py) is the
+same for both — only the rendering layer differs. Both `run()` functions
+take the same `(sections, logger, config=)` signature.
 """
+import sys
 import config
 
 from panels.cpu_graph import CpuGraphPanel
@@ -22,13 +29,11 @@ from panels.gpu       import GpuPanel
 from panels.network   import NetworkPanel
 from panels.processes import ProcessesPanel
 
-from logger  import Logger
-from display import run
+from logger import Logger
 
 
-# Section list: (panel_instance, refresh_hz). Order here drives the layout
-# in display.py — re-arrange in display.py's compose() if you want a
-# different visual order.
+# Section list: (panel_instance, refresh_hz). Order here drives the
+# layout in whichever frontend is active.
 sections = [
     (CpuGraphPanel(),                                config.CPU_GRAPH_HZ),
     (CpuPanel(),                                     config.CPU_CORES_HZ),
@@ -42,4 +47,10 @@ sections = [
 ]
 
 logger = Logger()
+
+if "--gui" in sys.argv:
+    from gui.main import run
+else:
+    from cli.display import run
+
 run(sections, logger, config=config)
