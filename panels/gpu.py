@@ -3,15 +3,30 @@
 Tries pynvml, then nvidia-smi for the basic GPU stats (util, VRAM, die temp,
 power draw). Extra temps (Hot Spot, Memory Junction) come from the shared
 LHM poller (panels.lhm) — nvidia-smi doesn't expose those values.
+
+Threading model:
+  pynvml calls into the WSL→Windows driver bridge can take 11-40ms — long
+  enough to drop keystrokes if they run on the UI thread. So a background
+  thread polls the driver every POLL_INTERVAL_SEC and stashes results in a
+  lock-guarded cache. `update()` on the UI thread just copies the cache —
+  typically sub-millisecond. Same pattern as panels/network.py and
+  panels/lhm.py.
 """
 import shutil
 import subprocess
+import threading
 
 from rich.text import Text
 
 from panels.base import (bar_gauge, health_for, fit_bar_width, fmt_bytes,
                           empty_color, heatmap_color, FILLED, EMPTY)
 from theme import LABEL, SECONDARY, BRIGHT, MEDIUM, DIM, heat_temp
+
+
+# How often the background thread refreshes GPU stats from the driver.
+# 0.5s matches the panel's natural cadence (2Hz) — finer is wasted, coarser
+# makes the bars feel sluggish.
+POLL_INTERVAL_SEC = 0.5
 
 
 class GpuPanel:
@@ -22,8 +37,18 @@ class GpuPanel:
         self._initialized = False
 
         # Extra temps from LHM, indexed by simplified name.
-        # Populated by _fetch_lhm_extras() which reads from panels.lhm cache.
+        # Populated by the background thread via _extract_lhm_extras().
         self.lhm_temps = {}    # {"hot_spot": 58.0, "memory": 54.0, "core": 46.0}
+
+        # ── Background polling thread state ─────────────────────────
+        # Started lazily on first update() so initialization happens after
+        # backend detection. The lock guards the cached values; reads in
+        # update() just copy them out.
+        self._lock = threading.Lock()
+        self._latest_gpus = []
+        self._latest_lhm_temps = {}
+        self._stop_event = threading.Event()
+        self._thread = None
 
     def _try_pynvml(self):
         try:
@@ -56,25 +81,83 @@ class GpuPanel:
         self.backend = None
 
     def update(self):
+        """UI-thread update — copies from the background-thread cache.
+
+        First call lazily detects the backend AND seeds the cache with one
+        synchronous reading (so the panel renders real numbers on the first
+        frame instead of zeros), then starts the polling thread. Subsequent
+        calls are just a lock-guarded dict copy — sub-millisecond.
+        """
         if not self._initialized:
             self._init_backend()
+            if self.backend is not None:
+                # One synchronous read so the very first render shows data.
+                # After this, all reads come from the background thread.
+                self._fetch_into_cache()
+                self._start_polling_thread()
+
         if self.backend is None:
             self.gpus = []
             return
+
+        with self._lock:
+            self.gpus = self._latest_gpus
+            self.lhm_temps = self._latest_lhm_temps
+
+    # ──────────────── Background polling ────────────────
+    def _start_polling_thread(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._poll_loop,
+            name="winston-gpu-poller",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _poll_loop(self):
+        while not self._stop_event.is_set():
+            self._fetch_into_cache()
+            if self._stop_event.wait(POLL_INTERVAL_SEC):
+                return
+
+    def _fetch_into_cache(self):
+        """Do the slow work — pynvml/nvidia-smi calls + LHM tree walk —
+        and stash results in the lock-guarded cache. Runs on the polling
+        thread (or once synchronously on first update).
+
+        pynvml ctypes calls release the GIL during the underlying syscall,
+        so while this thread is blocked in the driver, the asyncio event
+        loop on the main thread keeps running and can read keystrokes.
+        That's the whole point of putting this on a thread.
+        """
+        gpus = []
         try:
             if self.backend == "pynvml":
-                self._update_pynvml()
-            else:
-                self._update_nvidia_smi()
+                gpus = self._fetch_pynvml()
+            elif self.backend == "nvidia-smi":
+                gpus = self._fetch_nvidia_smi()
         except Exception as e:
             self.error = str(e)
-            self.gpus = []
+            gpus = []
 
-        # Refresh LHM temps every tick. Reading from the shared LHM poller
-        # is essentially free (just a dict lookup) — no need to throttle.
-        self._fetch_lhm_extras()
+        lhm_temps = self._extract_lhm_extras()
 
-    def _update_pynvml(self):
+        with self._lock:
+            self._latest_gpus = gpus
+            # If LHM walk returned nothing this cycle (transient cache miss),
+            # keep the last-known values rather than blanking the panel.
+            if lhm_temps:
+                self._latest_lhm_temps = lhm_temps
+
+    def shutdown(self):
+        """Stop the polling thread cleanly. Optional — safe to skip since
+        the thread is daemonized."""
+        self._stop_event.set()
+
+    # ──────────────── Driver fetchers (run on polling thread) ─────
+    def _fetch_pynvml(self):
         nv = self._pynvml
         n = nv.nvmlDeviceGetCount()
         out = []
@@ -104,9 +187,9 @@ class GpuPanel:
                 "temp": temp,
                 "power": power, "power_limit": power_limit,
             })
-        self.gpus = out
+        return out
 
-    def _update_nvidia_smi(self):
+    def _fetch_nvidia_smi(self):
         result = subprocess.run(
             ["nvidia-smi",
              "--query-gpu=name,utilization.gpu,memory.used,memory.total,"
@@ -143,22 +226,18 @@ class GpuPanel:
                 "power": power,
                 "power_limit": power_limit,
             })
-        self.gpus = out
+        return out
 
-    def _fetch_lhm_extras(self):
-        """Pull Hot Spot and Memory Junction GPU temps from LHM if available.
-        These aren't exposed by nvidia-smi/pynvml.
-
-        Reads from the shared LHM poller — no HTTP call here. The poller
-        runs on its own thread and refreshes the cached JSON every couple
-        seconds. This call is essentially free.
+    def _extract_lhm_extras(self):
+        """Pull Hot Spot and Memory Junction GPU temps from the shared LHM
+        cache. Pure function — returns the extras dict (or empty dict).
+        Caller decides whether to merge or replace.
         """
         from panels import lhm
         data = lhm.get_data()
         if data is None:
-            return  # LHM not available yet, keep last known values
+            return {}
 
-        # Walk the tree looking for GPU temp sensors
         extras = {}
 
         def walk(node, in_gpu_subtree=False):
@@ -188,9 +267,7 @@ class GpuPanel:
                     walk(c, in_gpu_subtree)
 
         walk(data)
-        if extras:
-            self.lhm_temps = extras
-        # If extras is empty, keep last known values
+        return extras
 
     # Color for any temperature reading — delegate to theme.
     # Kept as a method so existing call sites (self._temp_color(x)) work unchanged.

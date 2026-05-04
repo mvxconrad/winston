@@ -1,101 +1,262 @@
-# WINSTON
+<h1 align="center">W I N S T O N</h1>
 
-**W**ell-trained **I**ntuitive **N**eural **S**ystem **T**ranslating **O**bserved **N**umbers
+<p align="center">
+  <b>W</b>ell-trained &nbsp;·&nbsp; <b>I</b>ntuitive &nbsp;·&nbsp; <b>N</b>eural &nbsp;·&nbsp; <b>S</b>ystem &nbsp;·&nbsp;
+  <b>T</b>ranslating &nbsp;·&nbsp; <b>O</b>bserved &nbsp;·&nbsp; <b>N</b>umbers
+</p>
 
-A personal system monitor for the terminal. Watches CPU, RAM, GPU, disks, network, temperatures, and processes. Logs everything to CSV. Eventually, a local LLM reads what's happening and generates commentary.
+<p align="center"><i>Most system monitors show numbers. Winston watches the same numbers, learns what they mean for you, and talks about your machine like a person who knows you would.</i></p>
+
+A personal system monitor with a local-LLM butler. Watches CPU, RAM, GPU, disks, network, temperatures, and processes. Logs everything to CSV. A local Ollama model reads panel state and writes commentary that **gets more personal over time** — what apps you run, how you feel about them, when you run them, what your machine usually looks like. The bridge between raw hardware telemetry and useful observation is persistent memory ([see Memory](#memory)). Two frontends share the same engine: a PyQt6 desktop app (`--gui`) and a Textual TUI (default).
+
+## Quick links
+
+- [Run it](#run)
+- [Panels](#panels)
+- [LLM commentary](#llm-commentary)
+- [Memory](#memory) — what makes Winston more than a fancy `top`
+- [Architecture](#architecture)
+- [WSL setup (temps + network)](#wsl-setup-temps--network)
+- [Diagnostic env vars](#diagnostic-env-vars)
+- [Project layout](#project-layout)
+- [Roadmap](#roadmap)
 
 ## Stack
 
-- [Textual](https://github.com/Textualize/textual) — TUI framework
-- [Rich](https://github.com/Textualize/rich) — text styling
-- [psutil](https://github.com/giampaolo/psutil) — cross-platform system stats
-- [pynvml](https://pypi.org/project/pynvml/) — NVIDIA GPU stats (optional)
-- [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) — temperature data on Windows (optional but recommended on WSL)
+[Textual](https://github.com/Textualize/textual) + [Rich](https://github.com/Textualize/rich) (TUI), [PyQt6](https://pypi.org/project/PyQt6/) + [pyqtgraph](https://pyqtgraph.org/) (GUI), [psutil](https://github.com/giampaolo/psutil), [pynvml](https://pypi.org/project/pynvml/) (optional), [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) (optional, for WSL temps), [Ollama](https://ollama.com) (optional, for commentary).
+
+## GUI (desktop)
+
+`python winston.py --gui` — native PyQt6 window, GPU-accelerated charts via pyqtgraph, scrollable, smooth at 60 fps even while gaming.
+
+![Winston GUI](docs/winston_gui_v1.png)
+*Same panels as the TUI plus the BRAIN view (state · model · top apps · memory stats).*
+
+## CLI (TUI)
+
+`python winston.py` — runs in any terminal, hand-rolled braille graphs, full keyboard control.
+
+![Winston at idle](docs/screenshot-idle.png)
+*Idle — greeted, summarized the day, sitting quietly.*
+
+![Winston reacting to a load spike](docs/screenshot-active.png)
+*Triggered — `yes > /dev/null` on four cores. The `single_core_pegged` trigger fired.*
 
 ## Run
 
 ```bash
-pip install textual psutil pynvml
-python winston.py
+pip install textual psutil pynvml PyQt6 pyqtgraph
+ollama pull qwen2.5:3b-instruct           # routine commentary
+ollama pull qwen2.5:7b-instruct           # loaded on demand for /-asked questions
+python winston.py                          # TUI (default)
+python winston.py --gui                    # PyQt6 desktop app
 ```
 
-`Q` to quit, `R` to reset history graphs.
+`Q` quit · `R` reset graphs · `/` focus the ASK input. GUI also has `F11` fullscreen and `Ctrl+↑/↓/←/→` snap.
+
+All tunables live in `config.py` (refresh rates, LLM behavior, trigger thresholds). `winston.py` is just imports + the section list.
 
 ## Panels
 
-Each panel runs at its own refresh rate (configurable in `winston.py`). The logger writes a row at fixed 1Hz regardless of panel rates — gives clean time-series data for analysis.
+| Panel | Rate | What |
+| --- | --- | --- |
+| **CPU LOAD** | 4 Hz | Hand-rolled scrolling braille graph (htop/btop-style). |
+| **CORES** | 4 Hz | Per-core bars, 8-sample MA so blips don't flicker. |
+| **MEMORY** | 2 Hz | Single bar with `X of Y` size inline. |
+| **SYSTEM** | 0.5 Hz | Load avgs, procs, threads, swap, disk I/O, uptime. |
+| **DISK** | 0.1 Hz | Disk usage. Skips WSL `/` (vhdx on `C:`). |
+| **TEMPS** | 1 Hz | One row per device category — best representative sensor each, BIOS trip-points and firmware placeholders filtered. |
+| **GPU** | 2 Hz | Util + power inline, VRAM + size inline, CORE/HOTSPOT/VRAM temps inline. |
+| **NETWORK** | renders 2 Hz, host source polled **every 5 s** | Windows host stats via PowerShell (sees Chrome traffic). 5 s is intentional — see [the investigation](#investigation-networkpanel-and-dropped-keystrokes) below. |
+| **PROCESSES** | 1 Hz | Top 14 by CPU, merged from psutil (Linux/WSL) + PowerShell `Get-Process` (Windows host, daemon-cached every 5 s). Windows rows tagged `[win]`. |
+| **COMMENTARY** | event-driven | LLM-generated; see next section. |
+| **BRAIN** | 1 Hz, dirty-checked | Winston's internal state — current model, top apps from [memory](#memory), last trigger fired, memory.json stats. Toggleable via `SHOW_BRAIN_PANEL`. |
 
-### CPU LOAD (4Hz)
-Hand-rolled scrolling braille graph. Plotext was too jittery — re-laying out the full chart every frame caused axis labels to shift. This draws into fixed character positions: data scrolls right-to-left, axis labels are pinned. Same technique htop/btop use.
+## LLM commentary
 
-### CORES (4Hz)
-Per-core bars. Bars are rendered from an 8-sample moving average so OS-scheduler-driven blips don't make cores visually flicker between 0% and 100%. The displayed `%` is still live.
+A local Ollama model reads panel state and writes dry one-liners. Three trigger paths:
 
-### MEMORY / RAM (2Hz)
-Single bar with size shown below (`3.2GB of 30.9GB`). Uses the same `X of Y` format as DISK and GPU VRAM for visual consistency.
+1. **Startup ritual** — time-aware greeting (`Good morning, max.` / `Up late tonight, max?`) followed by a one-line retrospective from the last 24h of logs.
+2. **Event-driven** — `brain/triggers.py` evaluates per-second triggers (single core pegged, sustained CPU, thermal alerts, memory pressure, network burst, new heavy process, host app busy). When one fires, Winston comments on the specific event. Hysteresis on `new_heavy_process` (sustain_sec=3) kills 1-tick spike announcements.
+3. **Heartbeat** — every `HEARTBEAT_INTERVAL_SEC` (default 5 min) a routine status comment so Winston isn't silent during quiet periods.
 
-### SYSTEM (0.5Hz)
-Compact 6-line summary: load averages (1m/5m/15m), process count, thread count, swap usage, disk I/O rates, uptime. Disk I/O fades dim when idle (<1KB/s) so it doesn't visually compete when nothing's happening.
+Output streams token-by-token via a typewriter buffer (decouples LLM gen rate from display rate). Press `/` to focus the ASK input and ask a question — last 3 Q&A pairs are kept as multi-turn context.
 
-### DISK (0.1Hz)
-Disk usage. Skips the WSL `/` mount — it lives inside a vhdx file on `C:` so showing it as a separate disk is misleading. Title auto-pluralizes (DISK vs DISKS) based on count.
+Every prompt is personalized from [memory](#memory) — Winston sees what you call each app (`nickname`), what kind of thing it is (`type`), how you feel about it (`feeling`), and what your machine usually looks like, so his commentary references *you* instead of restating telemetry.
 
-### TEMPS (1Hz, LHM polled every 2s)
-One row per device category — CPU, GPU, AIO, SSD, MOBO. Each row picks the most representative sensor for that device (CPU Tctl over individual cores, GPU Hot Spot over VRAM/Core, AIO Liquid over Sensor Critical). Filters out:
-- BIOS trip-points (Critical Temp, Tj Max, etc.) — these are config values, not measurements
-- Firmware placeholders (NZXT Krakens report exactly 85.0°C for sensors they don't actually have)
-- Out-of-range readings (<5°C or >130°C)
+### Tiered model loading (so VRAM stays free for games)
 
-Labels and bars are colored by temperature severity using a 7-stop heatmap palette — eye lands on hot rows.
+Both models default to `keep_alive=0` — they load on demand, generate the answer, and unload immediately. Between commentaries, Winston holds zero VRAM. Cold loads are quick because Ollama keeps the weights in system RAM:
 
-### GPU (2Hz)
-Util bar with `25W of 220W` power draw inline. VRAM bar with `2.1GB of 12.0GB` size inline. Three temp readings on one line: CORE / HOTSPOT / VRAM, each colored by its own value. HOTSPOT and VRAM come from LHM (nvidia-smi doesn't expose them).
+| Path | Model | Cold load | Triggers |
+| --- | --- | --- | --- |
+| Greeting, retrospective, heartbeat, routine, all triggered events | **qwen2.5:3b-instruct** (~2 GB) | 1-3 s | Startup ritual, every 5 min heartbeat, occasional event triggers |
+| User questions via `/` | **qwen2.5:7b-instruct** (~6 GB) | 5-10 s | Only on `/`-ask |
 
-GPU name strips redundant prefixes when space is tight: "NVIDIA GeForce RTX 4070 SUPER" → "RTX 4070 SUPER".
+You'll see "thinking…" for that brief window each time Winston has something to say. Bump `LLM_FAST_KEEP_ALIVE_SEC` or `LLM_QUALITY_KEEP_ALIVE_SEC` in `config.py` (e.g. to 60-300) if you want quick follow-ups at the cost of VRAM idle.
 
-### NETWORK (2Hz)
-On WSL, defaults to **Windows host stats** via PowerShell `Get-NetAdapterStatistics`. WSL2's virtual interfaces only see traffic launched from inside WSL — Chrome, games, and most desktop apps run on Windows and never touch the WSL counters. Querying the host gives the real numbers.
+## Memory
 
-The PowerShell call is ~50ms. Doing it synchronously at 2Hz blocked the UI noticeably, so it runs on a background thread and the panel reads cached values.
+What makes Winston more than a fancy `top`. The dashboard shows numbers; memory is what lets him *recognize* what those numbers mean for you. `logs/memory.json` is the canonical store. Two ways things end up there:
 
-Rates are smoothed over a 2-second rolling window to avoid spikes/zeros from uneven tick spacing. Peak download/upload rates are tracked persistently — on init, the panel scans `logs/raw/observations.csv` (single-pass O(n) max) to find the highest historical rates and seeds the graph scale with those. Graphs scale to observed peaks, so a speedtest fills the bars dramatically while routine YouTube traffic shows as a small fraction. The peak only ever grows.
+**1. Auto-derived from observation.** Every second the CSV log gains a row. `learn_from_log()` scans the last 7 days and ranks apps by how long they were the top process — building per-app fingerprints (avg CPU, peak CPU, avg GPU when this app was top, hours seen). Runs on launch.
 
-### PROCESSES (1Hz)
-Top 8 by CPU. CPU% column uses the same heatmap palette as everything else, so a process at 50% looks visually consistent with a CPU panel at 50%.
+**2. User-told in conversation.** When you tell Winston something — *"Ark is my favorite game"* — he ends his reply with an invisible marker that gets parsed, stripped from the displayed text, and applied to memory:
 
-### COMMENTARY (placeholder)
-Currently cycles through hardcoded status messages. This is where Stage 5 (LLM commentary) will plug in.
+- `[APP: <process-name> key=value, key=value, -dropkey]` — per-app structured attrs. Multiple keys allowed, **they merge** (setting `nickname=Ark` doesn't erase a prior `feeling=favorite`). Prefix `-key` to drop a single attr.
+- `[REMEMBER: <fact>]` — free-form note about you that doesn't bind to one app.
+- `[FORGET: <existing note>]` — revoke a saved note.
 
-## Architecture notes
+Markers are physically cut from the streaming buffer the moment the closing `]` arrives, so the user never sees them flicker. Same treatment for "Now let's respond:" planning preambles the model occasionally leaks.
 
-### Refresh rate decoupling
-Each panel updates at its own rate (constants at the top of `winston.py`). The display layer schedules per-panel intervals — no master tick that everyone hangs off. Logger ticks independently at 1Hz so the CSV is always evenly spaced regardless of how fast individual panels update.
+### What memory looks like
 
-### Theme is a single source of truth
-All color decisions live in `theme.py`. Panels never define colors locally — they import `heat_pct(percent)` and `heat_temp(celsius)` which return colors from a 7-stop palette. Switching the entire app's color scheme is a one-file edit.
+```json
+{
+  "user": { "name": "max" },
+  "machine": { "host": "PC", "cpu": "...", "gpu": "...", "ram_gb": 30.9 },
+  "apps": {
+    "arkascended": {
+      "name": "ArkAscended",      // canonical (locked, never renamed)
+      "hours": 0.45,              // ↓ AUTO from CSV scan
+      "avg_cpu": 16.5,
+      "peak_cpu": 41.6,
+      "avg_gpu_when_top": 39.1,
+      "nickname": "Ark",          // ↓ user-told via [APP:] markers
+      "type": "game",
+      "feeling": "favorite"
+    }
+  },
+  "notes": [
+    { "ts": "...", "text": "max is gaming whenever ArkAscended is running", "source": "user" }
+  ]
+}
+```
 
-### Background polling threads
-Anything that takes more than a few ms (PowerShell calls, HTTP fetches) runs on a daemon thread, not the UI thread. The shared LHM poller (`panels/lhm.py`) fetches once and both the GPU and Temps panels read from the same cache — no duplicate HTTP requests.
+`AUTO_APP_KEYS` (name, hours, avg_cpu, peak_cpu, avg_gpu_when_top) come first in each entry's JSON; user-added keys append after. `learn_from_log` rebuilds the auto fields on each scan but preserves user keys.
 
-### Bytes formatting
-`fmt_bytes()` returns `KB / MB / GB / TB / PB` (powers of 1024 with conventional suffixes). Same as htop, btop, and Windows File Explorer.
+### Suggested attribute keys
 
-## Temperatures on WSL
+Not enforced — Winston can invent his own when nothing fits.
 
-WSL2's kernel doesn't include lm-sensors, so reading CPU/GPU/etc. temps directly from inside WSL doesn't work. Workaround: run [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) on Windows and bridge to it.
+| Key | What | Example values |
+| --- | --- | --- |
+| `nickname` | What you call it | `Ark`, `Doom`, `vscode` |
+| `type` | What kind of app | `game`, `ide`, `browser`, `comm`, `music`, `dev` |
+| `feeling` | How you feel about it | `favorite`, `hate`, `necessary`, `fun` |
+| `role` | When/why it runs | `work`, `leisure`, `background`, `daily` |
+| `launched_via` | How it gets started | `steam`, `epic`, `manually`, `cron` |
+| `notes` | Short per-app fact | `"crashes on launch"`, `"streaming only"` |
 
-### One-time setup
+### Robustness — input forgiveness, no hardcoded user data
+
+Winston isn't perfect at marker syntax. The memory layer corrects on the fly:
+
+- **Suffix stripping** — `_normalize_app_key("ArkAscended.exe")` → `arkascended`. Same canonical key whether the model writes the `.exe` or not.
+- **Nickname-aware lookup** — `[APP: Ark ...]` after `nickname=Ark` is set finds the existing entry, doesn't fork a duplicate.
+- **Unique prefix matching** — `[APP: Ark ...]` lands on `arkascended` if no other key starts with "ark". 3-char floor + uniqueness requirement keep "node" from accidentally swallowing "nodejs".
+- **Attribute bucket auto-correction** — `type=favorite` (mis-bucketed; "favorite" is a feeling-word) auto-swaps to `feeling=favorite`. Vocabularies are starter sets; new values pass through unchanged.
+- **Migration on load** — older memory.json files with `.exe` duplicates, orphan short-name entries, mis-bucketed attrs, or angle-bracket placeholder leaks (`<max>`) get cleaned up automatically when the file loads.
+
+### How prompts read memory
+
+The personality block at the top of each prompt is built from memory. Apps render with **user-told facts FIRST**, auto stats trail in parens. Nicknames replace canonical names so the model sees "Ark" not "ArkAscended" in the snapshot. Notes auto-flip from third-person storage to second-person at render time ("max codes at night" stored → "you code at night" in the prompt) so the model addresses you, not a third party. The user's name is read from `memory.get_user_name()` — nothing about the prompt is hardcoded to a specific person.
+
+### How to inspect
+
+- **BRAIN panel** — top apps + last trigger + `MEMORY N apps · M notes · learned HH:MM:SS`.
+- **`cat logs/memory.json`** — full store, hand-readable.
+- **`tail -f logs/reasoning.log`** — every prompt and response in real-time, with markers Winston emitted (and what they did to memory).
+
+## Architecture
+
+### Master frame loop (30 FPS)
+
+The whole dashboard refreshes on a single 30 Hz clock (`FRAME_HZ` in `config.py`). One `set_interval` in `display.py:WinstonApp.on_mount` drives `_frame_tick`, which checks each panel's per-panel rate and only fires `panel.update()` when due. Widget refreshes are batched per frame so Textual's compositor sees one coherent pass instead of 14 uncoordinated ones.
+
+Why it matters: visual consistency (no panel jitter from mismatched cadences) and input responsiveness (asyncio loop has time to read keystrokes between frames).
+
+### The 5 ms rule: heavy work goes on a thread
+
+Anything that takes more than ~5 ms must run on a daemon thread. The UI panel just reads from a thread-safe cache. This is how btop adds 30 panels without lagging.
+
+| Thread | Module | Why |
+| --- | --- | --- |
+| `winston-lhm-poller` | `panels/lhm.py` | LHM HTTP fetch — GPU and Temps panels share the cache. |
+| `winston-net-poller` | `panels/network.py` | PowerShell `Get-NetAdapterStatistics` (50-200 ms each). |
+| `winston-gpu-poller` | `panels/gpu.py` | pynvml driver calls (11-40 ms spikes on WSL). |
+| `winston-llm-worker` | `brain/client.py` | Ollama HTTP streaming. |
+
+### LLM calls are FIFO, single-flight
+
+`brain/client.py` runs *one* worker thread with a `queue.Queue`. Reasons: UI thread never blocks on Ollama (calls take seconds), and parallel calls would just thrash a single GPU. FIFO matches user expectations.
+
+### Lazy stream timers in CommentaryPanel
+
+The typewriter (25 Hz) and cursor blink (2.5 Hz) timers are only scheduled while a stream is in flight. Idle Winston has zero CommentaryPanel timers running.
+
+### Two frontends, one orchestrator
+
+Winston ships two frontends — `cli/display.py` (Textual TUI, default) and `gui/main.py` (PyQt6 desktop, `--gui`) — and the LLM commentary logic lives in **neither**. It lives in `brain/commentary_engine.py:CommentaryEngine`, which owns:
+
+- The state machine (THINKING / STREAMING / IDLE / ERROR / DISABLED)
+- Q&A history + multi-turn context (last 3 pairs)
+- Streaming buffer + typewriter cursor advancement
+- Trigger evaluation (the 7 triggers in `brain/triggers.py` plus the 1Hz busy-gate / heartbeat / stale-quiet rules)
+- Prompt-building dispatch (`build_greeting / build_retrospective / build_triggered / build_observation / build_conversational`)
+- Model tier selection
+
+Each frontend is a thin renderer + timer driver that calls into the engine. Adding a third frontend (web, mobile) just means writing another renderer — no LLM logic to duplicate.
+
+Why this matters: when we first added the GUI, the trigger evaluation got duplicated and rules drifted between frontends. Extracting into the engine fixed both copies at once and means future trigger / heartbeat tweaks live in one place.
+
+### Investigation: NetworkPanel and dropped keystrokes
+
+This bug took a while to find — keeping the writeup short here, but it's worth knowing why `NETWORK` polls so slowly.
+
+Symptom: typing into the ASK input dropped ~1 in 20 characters. Felt like network lag, but local.
+
+What it actually was: `panels/network.py` polls `Get-NetAdapterStatistics` via PowerShell on a daemon thread. Every poll spawns a fresh PowerShell process across the WSL→Windows boundary — 50-200 ms of process creation per call. Even though `subprocess.run()` releases the GIL during the wait, the GIL handoffs around subprocess return + `text=True` decoding repeatedly poked the asyncio loop, and stdin reading occasionally lost a character to the noise.
+
+Tested 0.5 s / 2 s / 5 s polling: 0.5 s dropped 1 in 20, 2 s dropped occasional letters, **5 s clean**. So `POLL_INTERVAL_SEC = 5.0` in `panels/network.py`, with a comment.
+
+Confirmed via `WINSTON_NO_NET=1` (typing perfect) vs `WINSTON_NO_LHM=1` (typing still dropped) — only the cross-OS PowerShell path causes drops. LHM JSON parsing on its thread doesn't, because that work is local; same for pynvml via ctypes.
+
+Proper future fix: keep a long-lived PowerShell session and pipe queries to its stdin — eliminates per-call process churn, can go back to 1-2 Hz polling. ~30 line change.
+
+## Diagnostic env vars
+
+For chasing future UI lag or input drops:
+
+```bash
+# Disable background threads (bisect GIL contention):
+WINSTON_NO_THREADS=1   # both NetworkPanel and LHM threads off
+WINSTON_NO_NET=1       # only NetworkPanel thread off
+WINSTON_NO_LHM=1       # only LHM thread off
+
+# Disable specific panel ticks (they still draw their primed values):
+WINSTON_DISABLE_PANELS=GpuPanel,StatusBar python3 winston.py
+
+# Catch slow ticks (logs to /tmp/winston_timing.log):
+WINSTON_TIMING=1 WINSTON_TIMING_MS=5 python3 winston.py
+```
+
+## WSL setup (temps + network)
+
+WSL2 doesn't include lm-sensors, and its virtual NIC only sees traffic launched from inside WSL. Winston bridges to Windows for both.
+
+### LibreHardwareMonitor (for temps)
 
 ```powershell
 winget install LibreHardwareMonitor.LibreHardwareMonitor
 ```
 
-Launch it as Administrator. Then:
-- **Options → Remote Web Server → Run** (HTTP endpoint on port 8085)
+Launch as Administrator, then:
+- **Options → Remote Web Server → Run** (port 8085)
 - **Options → Run On Windows Startup**
 - **Options → Minimize To Tray**
 
-Add a firewall rule so WSL can reach LHM (PowerShell as Administrator):
+Firewall (PowerShell as Admin):
 
 ```powershell
 New-NetFirewallRule -DisplayName "LHM Web Server (WSL only)" `
@@ -103,63 +264,78 @@ New-NetFirewallRule -DisplayName "LHM Web Server (WSL only)" `
   -Profile Any -RemoteAddress 127.0.0.1,172.16.0.0/12
 ```
 
-Locked to localhost + WSL subnet only. Other devices on the network can't reach it.
+Locked to localhost + WSL subnet only. Winston auto-detects the Windows host IP from `/proc/net/route`.
 
-### How Winston finds LHM
+### Ollama (for commentary)
 
-Detection order:
-1. Native Linux sensors (psutil) — works on bare Linux/macOS
-2. Cached known-good host (last IP that worked, cached across LHM polls)
-3. `localhost:8085`
-4. Windows host gateway IP — auto-detected from `/proc/net/route`, no config needed; works after reboots, network changes, etc.
-5. PowerShell WMI ACPI thermal zones (basic fallback, often returns nothing)
-6. Polite "no sensors" message
+Install Ollama on Windows. Same firewall pattern as LHM, port `11434`. Pull both models so tiering works (the 3B is the resident one and the only one that truly needs to be there):
 
-The active backend is shown at the top of the TEMPS panel (`via LHM`, `via WMI`, etc.).
+```powershell
+ollama pull qwen2.5:3b-instruct
+ollama pull qwen2.5:7b-instruct
+```
 
 ## Project layout
 
 ```
-winston.py              # entry point — refresh-rate constants, section list
-display.py              # Textual app, custom chrome, layout CSS, CpuGraphWidget
-theme.py                # all color decisions; heat_pct() / heat_temp() helpers
-logger.py               # CSV writer
-panels/
-  __init__.py
+winston.py              # entry point — picks frontend via --gui flag
+config.py               # all tunables (FRAME_HZ, GPU_BUSY_*, panel hz, LLM, triggers)
+theme.py                # color decisions: heat_pct() / heat_temp() helpers
+logger.py               # 1 Hz CSV writer
+input_test.py           # standalone Textual harness for input-drop debugging
+
+panels/                 # data layer — SHARED across frontends
   base.py               # bar gauges, braille graph, fmt_bytes
-  cpu_graph.py          # data class — display.py builds the actual graph widget
-  cpu.py                # per-core bar grid
-  ram.py                # memory bar
-  system.py             # load avg, procs, threads, swap, I/O, uptime
-  disk.py               # Windows + Linux mount listing
-  temps.py              # multi-backend (native / LHM / WMI), smart device labels
-  gpu.py                # pynvml or nvidia-smi + LHM enrichment
-  network.py            # PowerShell host stats on WSL, smoothed rates, peak tracking
-  processes.py          # top N by CPU
+  cpu_graph.py          # CPU-history data class
+  cpu.py · ram.py · system.py · disk.py · processes.py
+  temps.py              # multi-backend (native/LHM/WMI), smart device labels
+  gpu.py                # pynvml/nvidia-smi + LHM enrichment, own poll thread
+  network.py            # PowerShell host stats (5 s poll), smoothed, peak-tracked
   lhm.py                # shared LHM HTTP poller (background thread, single cache)
-logs/
-  raw/
-    observations.csv    # 1 row/sec, all panel data — gitignored
-diag_lhm.py             # standalone connectivity diagnostic for LHM/WSL setup
-perf_diag.py            # times each panel's update/render to find slowness
+  brain.py              # BRAIN panel data class (rendered by both frontends)
+
+brain/                  # LLM layer — SHARED across frontends
+  client.py             # Ollama client; FIFO worker thread
+  prompt.py             # all prompt builders + personality block
+  baselines.py          # rolling mean/stddev for anomaly detection
+  triggers.py           # trigger functions + TriggerRunner
+  history.py            # single-pass O(n) CSV scanner
+  memory.py             # persistent JSON-backed memory + marker pipeline.
+                        # See [Memory](#memory).
+  commentary_engine.py  # backend-agnostic orchestrator — state machine,
+                        # trigger evaluation, heartbeat, stale-quiet,
+                        # Q&A history, marker parsing/cutting on stream.
+                        # Both frontends consume this.
+
+cli/                    # TUI frontend — only renders engine state
+  display.py            # Textual app + CommentaryPanel renderer
+  ui/ask.py             # legacy modal popup (not currently wired)
+
+gui/                    # desktop frontend — only renders engine state
+  main.py               # PyQt6 + pyqtgraph; QMainWindow + view widgets
+
+logs/                   # gitignored
+  raw/observations.csv  # 1 row/sec time-series CSV
+  memory.json           # canonical persistent memory
+  reasoning.jsonl       # every prompt + response (machine-parseable)
+  reasoning.log         # same events, human-readable mirror
 ```
 
-Adding a new panel: drop a class in `panels/` with `update()`, `render(width=None)`, `csv_headers()`, `csv_columns()` methods. Optional `title` property for dynamic panel titles. Add it to the section list in `winston.py` with its refresh rate, and add a layout slot in `display.py`.
+**Adding a panel:** drop a class in `panels/` with `update()`, `render(width=None)`, `csv_headers()`, `csv_columns()`. Add it to the section list in `winston.py` and a layout slot in BOTH `cli/display.py` (`compose()`) and `gui/main.py` (`WinstonGui.__init__` row layout). The data class is shared.
 
-## Logging
+**Adding a trigger:** write a function in `brain/triggers.py` taking `(sections, baselines, cfg)` and returning a `TriggerEvent` or `None`. Register it in `TRIGGER_FUNCTIONS` and add a config block in `config.py:TRIGGERS`. Both frontends pick it up automatically — the engine evaluates all registered triggers at 1 Hz.
 
-Every second the logger appends one row to `logs/raw/observations.csv` with every panel's data. After a day: ~86,400 rows, ~12MB. Used for:
-- Long-term trends
-- Persistent network peak tracking
-- Eventually: LLM commentary input
-
-Gitignored.
+**Adding anything that does I/O, subprocess, or syscalls:** put the slow work on a daemon thread. UI panel reads from a lock-guarded cache. See [the 5 ms rule](#the-5-ms-rule-heavy-work-goes-on-a-thread).
 
 ## Roadmap
 
-See `TODO.md`. Next up is **Stage 5: AI commentary** — wiring a local LLM (Ollama running qwen2.5:7b on the Windows host) to read recent observations and generate insights. The COMMENTARY panel at the bottom is already in the layout, just needs the LLM connection.
+See [`TODO.md`](TODO.md). Short version of what's next:
 
-Long-shot is **Stage 9: Process Graph View** — Obsidian-style force-directed graph of running processes, with size encoding memory and color encoding CPU load. Pop it open with `G`, see the *shape* of what your computer is doing.
+- **5.5b** — fully tier-aware preemption (notable preempts routine mid-stream, not just alerts).
+- **5.6** — tools the LLM can call (`read_log`, `get_process_details`, `query_baseline`).
+- **5.7** — refactor: split `display.py` and `panels/temps.py` along natural seams.
+- **5.8** — cleanups from v0.8 review (memory schema dedup, throttle commentary repaints to FPS clock, more usage-pattern tools).
+- **9** — process graph view (`G` opens an Obsidian-style force-directed graph; nodes = processes, size = memory, color = CPU).
 
 ## Why "Winston"
 
