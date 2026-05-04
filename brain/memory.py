@@ -181,6 +181,10 @@ class Memory:
         Writes fields in a deterministic, human-readable order
         (user → last_learned → machine → apps) rather than alphabetic
         sort, so the file reads top-down like a profile.
+
+        Also regenerates the markdown vault under `vault/` so the
+        human-readable mirror stays in sync. JSON is canonical; vault
+        is derived.
         """
         # Build an ordered dict containing only known top-level keys so
         # legacy fields can't sneak back in after migration. Python dicts
@@ -203,6 +207,14 @@ class Memory:
         except OSError:
             # Best-effort. A failed save is not fatal — we'll try again next
             # time the caller invokes save().
+            pass
+
+        # Regenerate the markdown vault. Best-effort, never raises — the
+        # JSON above is the source of truth.
+        try:
+            from brain.vault import write_all
+            write_all(self.facts)
+        except Exception:
             pass
 
     # ──────────────── Explicit facts ────────────────

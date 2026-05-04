@@ -55,6 +55,7 @@ TEMPS_HZ       = 1.0
 GPU_HZ         = 2.0
 NETWORK_HZ     = 2.0
 PROCESSES_HZ   = 1.0
+PROCESSES_LIMIT = 14   # rows shown in the PROCESSES panel
 
 LOGGER_HZ      = 1.0  # fixed-rate CSV writes (clean time-series for analysis)
 

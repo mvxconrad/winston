@@ -109,11 +109,11 @@ class HeatBar(QProgressBar):
     """Progress bar whose fill color is driven by the value — mirrors
     the TUI's heat-mapped bars. Single source of truth: theme.heat_pct."""
 
-    def __init__(self, parent=None, max_val=100):
+    def __init__(self, parent=None, max_val=100, height=10):
         super().__init__(parent)
         self.setRange(0, int(max_val))
         self.setTextVisible(False)
-        self.setFixedHeight(10)
+        self.setFixedHeight(height)
         self._max_val = max_val
         self._apply(0)
 
@@ -208,7 +208,7 @@ class CoresView(QWidget):
         self.panel = panel
         self._grid = QVBoxLayout(self)
         self._grid.setContentsMargins(0, 0, 0, 0)
-        self._grid.setSpacing(2)
+        self._grid.setSpacing(1)
         self._rows = []  # list of (label, bar, value_label) per core
 
     def refresh(self):
@@ -222,7 +222,7 @@ class CoresView(QWidget):
                 idx_label.setFont(_mono(9))
                 idx_label.setStyleSheet(f"color: {DIM};")
                 idx_label.setFixedWidth(20)
-                bar = HeatBar()
+                bar = HeatBar(height=8)
                 val_label = QLabel("0%")
                 val_label.setFont(_mono(9))
                 val_label.setStyleSheet(f"color: {DIM};")
@@ -249,23 +249,39 @@ class CoresView(QWidget):
 
 
 class MemoryView(QWidget):
-    """RAM bar with size text below."""
+    """RAM bar + inline percent/size + free + (optional) cached/buffers.
+    Spread out vertically with stretch between rows so the box fills its
+    share of row1 instead of showing a black gap below."""
 
     def __init__(self, panel, parent=None):
         super().__init__(parent)
         self.panel = panel
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setContentsMargins(0, 8, 0, 8)
+        layout.setSpacing(8)
+
+        self._label = QLabel("0% 0.0GB of 0.0GB")
+        self._label.setFont(_mono(11))
+        self._label.setStyleSheet(f"color: {MEDIUM};")
+        self._label.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(self._label)
 
         self._bar = HeatBar()
-        self._bar.setFixedHeight(14)
+        # Taller bar so MEMORY has a strong visual anchor in its box.
+        self._bar.setFixedHeight(18)
         layout.addWidget(self._bar)
 
-        self._label = QLabel("0.0GB of 0.0GB")
-        self._label.setFont(_mono(10))
-        self._label.setStyleSheet(f"color: {MEDIUM};")
-        layout.addWidget(self._label)
+        self._avail = QLabel("")
+        self._avail.setFont(_mono(9))
+        self._avail.setTextFormat(Qt.TextFormat.RichText)
+        self._avail.setStyleSheet(f"color: {DIM};")
+        layout.addWidget(self._avail)
+
+        self._extras = QLabel("")
+        self._extras.setFont(_mono(9))
+        self._extras.setTextFormat(Qt.TextFormat.RichText)
+        self._extras.setStyleSheet(f"color: {DIM};")
+        layout.addWidget(self._extras)
         layout.addStretch(1)
 
     def refresh(self):
@@ -273,15 +289,37 @@ class MemoryView(QWidget):
         self._bar.setValue(pct)
         used = getattr(self.panel, "used", 0) or 0
         total = getattr(self.panel, "total", 0) or 0
+        avail = getattr(self.panel, "available", None)
+        if avail is None:
+            avail = max(0, total - used)
         gb = lambda b: b / (1024 ** 3)
-        # Show percent + sizes inline so the visual matches GPU/VRAM/DISK.
-        # Percent gets the heat-mapped color; sizes stay neutral.
         color = heat_pct(pct)
-        self._label.setTextFormat(Qt.TextFormat.RichText)
         self._label.setText(
             f"<span style='color:{color}; font-weight:bold;'>{int(round(pct))}%</span>"
             f"  <span style='color:{MEDIUM};'>{gb(used):.1f}GB of {gb(total):.1f}GB</span>"
         )
+        self._avail.setText(
+            f"<span style='color:{DIM};'>free  </span>"
+            f"<span style='color:{MEDIUM};'>{gb(avail):.1f}GB</span>"
+        )
+        # psutil exposes cached + buffers on Linux; show them if present
+        # so the panel has a third data point and looks intentional rather
+        # than half-empty. On Windows this attr won't exist — falls through.
+        cached = getattr(self.panel, "cached", None)
+        if cached is None:
+            try:
+                import psutil
+                vm = psutil.virtual_memory()
+                cached = getattr(vm, "cached", None)
+            except Exception:
+                cached = None
+        if cached:
+            self._extras.setText(
+                f"<span style='color:{DIM};'>cache </span>"
+                f"<span style='color:{MEDIUM};'>{gb(cached):.1f}GB</span>"
+            )
+        else:
+            self._extras.setText("")
 
 
 class GpuView(QWidget):
@@ -362,39 +400,137 @@ class GpuView(QWidget):
 
 
 class ProcessesView(QWidget):
-    """Top-N process table — PID / NAME / CPU% / MEM."""
+    """Top-N process table — PID / NAME / CPU% / MEM. Tight line-height
+    so we fit ~14 rows in the box rather than 7 floating in black space.
+
+    Column alignment quirk: QLabel RichText collapses runs of whitespace
+    by default. We use a per-row 4-column QGridLayout so each cell renders
+    in its own measured column — no &nbsp; padding needed, and it stays
+    aligned across rows regardless of name length.
+
+    On WSL, this view ALSO shows Windows-host processes if `panel.win_procs`
+    is populated (panels/host_processes.py polls PowerShell in a daemon
+    thread so the spawn cost doesn't block the UI). Linux + Windows
+    processes are merged into one ranked list with a `[win]` tag so the
+    user can tell which side a process lives on.
+    """
 
     def __init__(self, panel, parent=None):
         super().__init__(parent)
         self.panel = panel
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
+        layout.setSpacing(0)
 
-        header = QLabel("   PID  NAME                       CPU%      MEM")
-        header.setFont(_mono(9))
-        header.setStyleSheet(f"color: {DIM};")
-        layout.addWidget(header)
+        # Header — also a grid so columns line up with the data rows.
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(8)
 
-        self._rows_label = QLabel("")
-        self._rows_label.setFont(_mono(9))
-        self._rows_label.setTextFormat(Qt.TextFormat.RichText)
-        self._rows_label.setStyleSheet(f"color: {MEDIUM};")
-        layout.addWidget(self._rows_label, stretch=1)
+        def _hdr(text, width, align=Qt.AlignmentFlag.AlignLeft):
+            lbl = QLabel(text)
+            lbl.setFont(_mono(9))
+            lbl.setStyleSheet(f"color: {DIM};")
+            lbl.setFixedWidth(width)
+            lbl.setAlignment(align | Qt.AlignmentFlag.AlignVCenter)
+            return lbl
+
+        header_row.addWidget(_hdr("PID", 50, Qt.AlignmentFlag.AlignRight))
+        header_row.addWidget(_hdr("NAME", 200))
+        header_row.addWidget(_hdr("CPU%", 60, Qt.AlignmentFlag.AlignRight))
+        header_row.addWidget(_hdr("MEM", 80, Qt.AlignmentFlag.AlignRight))
+        header_row.addStretch(1)
+        layout.addLayout(header_row)
+
+        # Body: one QHBoxLayout per data row, all sharing the same column
+        # widths as the header.
+        self._rows_box = QVBoxLayout()
+        self._rows_box.setContentsMargins(0, 0, 0, 0)
+        self._rows_box.setSpacing(1)
+        layout.addLayout(self._rows_box)
+        layout.addStretch(1)
+        self._row_widgets = []  # list of (pid, name, cpu, mem) labels
+
+    def _ensure_rows(self, n):
+        while len(self._row_widgets) < n:
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(8)
+
+            pid = QLabel("")
+            pid.setFont(_mono(9))
+            pid.setFixedWidth(50)
+            pid.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            name = QLabel("")
+            name.setFont(_mono(9))
+            name.setFixedWidth(200)
+            name.setTextFormat(Qt.TextFormat.RichText)
+
+            cpu = QLabel("")
+            cpu.setFont(_mono(9))
+            cpu.setFixedWidth(60)
+            cpu.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            mem = QLabel("")
+            mem.setFont(_mono(9))
+            mem.setFixedWidth(80)
+            mem.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            row.addWidget(pid)
+            row.addWidget(name)
+            row.addWidget(cpu)
+            row.addWidget(mem)
+            row.addStretch(1)
+            self._rows_box.addLayout(row)
+            self._row_widgets.append((pid, name, cpu, mem))
 
     def refresh(self):
         from panels.base import fmt_bytes
-        lines = []
-        for cpu, mem, name, pid in getattr(self.panel, "procs", []):
-            color = heat_pct(cpu) if cpu >= 1 else DIM
-            name_disp = (name[:22] + "…") if len(name) > 23 else name
-            lines.append(
-                f"<span style='color:{DIM};'>{pid:>6}</span>  "
-                f"<span style='color:{BRIGHT if cpu > 50 else MEDIUM};'>{name_disp:<23}</span>  "
-                f"<span style='color:{color}; font-weight:bold;'>{cpu:5.1f}%</span>  "
-                f"<span style='color:{DIM};'>{fmt_bytes(mem):>7}</span>"
-            )
-        self._rows_label.setText("<br>".join(lines))
+
+        linux_procs = list(getattr(self.panel, "procs", []) or [])
+        win_procs = list(getattr(self.panel, "win_procs", []) or [])
+
+        # Merge: tag each row with origin, sort by CPU desc, cap at panel
+        # limit so the table doesn't explode when a Windows game is running.
+        merged = [(cpu, mem, name, pid, "lin") for cpu, mem, name, pid in linux_procs]
+        merged += [(cpu, mem, name, pid, "win") for cpu, mem, name, pid in win_procs]
+        merged.sort(key=lambda r: -r[0])
+        cap = max(getattr(self.panel, "limit", 14), 14)
+        merged = merged[:cap]
+
+        self._ensure_rows(len(merged))
+        for i, (pid_w, name_w, cpu_w, mem_w) in enumerate(self._row_widgets):
+            if i < len(merged):
+                cpu, mem, name, pid, origin = merged[i]
+                color = heat_pct(cpu) if cpu >= 1 else DIM
+                name_color = BRIGHT if cpu > 50 else MEDIUM
+                tag = (f" <span style='color:{ACCENT};'>[win]</span>"
+                       if origin == "win" else "")
+                pid_w.setText(str(pid))
+                pid_w.setStyleSheet(f"color: {DIM};")
+                name_w.setText(
+                    f"<span style='color:{name_color};'>"
+                    f"{self._html_escape(name)}</span>{tag}"
+                )
+                cpu_w.setText(f"{cpu:5.1f}%")
+                cpu_w.setStyleSheet(
+                    f"color: {color}; font-weight: "
+                    f"{'bold' if cpu > 50 else 'normal'};"
+                )
+                mem_w.setText(f"{fmt_bytes(mem)}")
+                mem_w.setStyleSheet(f"color: {DIM};")
+                pid_w.show(); name_w.show(); cpu_w.show(); mem_w.show()
+            else:
+                pid_w.hide(); name_w.hide(); cpu_w.hide(); mem_w.hide()
+
+    @staticmethod
+    def _html_escape(s):
+        return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;"))
 
 
 class SystemView(QWidget):
@@ -417,37 +553,45 @@ class SystemView(QWidget):
     def refresh(self):
         from panels.base import fmt_bytes
         p = self.panel
-        # Load color: scale by cpu_count so 100% load = bright.
         cpu_count = max(1, getattr(p, "cpu_count", 1))
         def lc(load):
             return heat_pct((load / cpu_count) * 100)
-        # I/O dim when idle (<1KB/s).
         idle_io = (p.disk_read_rate < 1024 and p.disk_write_rate < 1024)
         io_color = DIM if idle_io else MEDIUM
-        # Swap red if any.
         swap_color = heat_pct(p.swap_pct) if p.swap_pct > 0 else DIM
-        # Uptime
         days = p.uptime_seconds // 86400
         hours = (p.uptime_seconds % 86400) // 3600
         mins = (p.uptime_seconds % 3600) // 60
-        self._label.setText(
-            f"<span style='color:{DIM};'>LOAD</span>  "
+        # Tight 5-line layout with consistent label width so columns align.
+        # line-height keeps rows close together so SYSTEM uses its full
+        # vertical budget instead of leaving black space.
+        rows = [
+            f"<span style='color:{DIM};'>LOAD </span>"
             f"<span style='color:{lc(p.load_1)}; font-weight:bold;'>{p.load_1:5.2f}</span> "
             f"<span style='color:{lc(p.load_5)};'>{p.load_5:5.2f}</span> "
-            f"<span style='color:{lc(p.load_15)};'>{p.load_15:5.2f}</span>"
-            f"<br><span style='color:{DIM};'>     1m    5m    15m</span>"
-            f"<br><span style='color:{DIM};'>PROCS</span> "
+            f"<span style='color:{lc(p.load_15)};'>{p.load_15:5.2f}</span>  "
+            f"<span style='color:{DIM};'>1·5·15m</span>",
+
+            f"<span style='color:{DIM};'>PROCS</span> "
             f"<span style='color:{MEDIUM};'>{p.proc_count}</span>  "
             f"<span style='color:{DIM};'>THR</span> "
-            f"<span style='color:{MEDIUM};'>{p.thread_count}</span>"
-            f"<br><span style='color:{DIM};'>SWAP</span>  "
-            f"<span style='color:{swap_color};'>{p.swap_pct:.1f}%</span> "
-            f"<span style='color:{DIM};'>{fmt_bytes(p.swap_used)} / {fmt_bytes(p.swap_total)}</span>"
-            f"<br><span style='color:{DIM};'>I/O</span>   "
+            f"<span style='color:{MEDIUM};'>{p.thread_count}</span>",
+
+            f"<span style='color:{DIM};'>SWAP </span>"
+            f"<span style='color:{swap_color}; font-weight:bold;'>{p.swap_pct:.1f}%</span> "
+            f"<span style='color:{DIM};'>{fmt_bytes(p.swap_used)} of {fmt_bytes(p.swap_total)}</span>",
+
+            f"<span style='color:{DIM};'>I/O  </span>"
             f"<span style='color:{io_color};'>R {fmt_bytes(p.disk_read_rate)}/s</span>  "
-            f"<span style='color:{io_color};'>W {fmt_bytes(p.disk_write_rate)}/s</span>"
-            f"<br><span style='color:{DIM};'>UP</span>    "
-            f"<span style='color:{MEDIUM};'>{int(days)}d {int(hours):02d}h {int(mins):02d}m</span>"
+            f"<span style='color:{io_color};'>W {fmt_bytes(p.disk_write_rate)}/s</span>",
+
+            f"<span style='color:{DIM};'>UP   </span>"
+            f"<span style='color:{MEDIUM};'>{int(days)}d {int(hours):02d}h {int(mins):02d}m</span>",
+        ]
+        # Generous line-height so the 5 rows spread to fill the row1
+        # height budget instead of leaving black space below.
+        self._label.setText(
+            f"<div style='line-height:240%;'>{'<br>'.join(rows)}</div>"
         )
 
 
@@ -648,6 +792,164 @@ class NetworkView(QWidget):
             f"<span style='color:{MEDIUM};'>↓ {fmt_bytes(p.total_rx)}</span>  "
             f"<span style='color:{MEDIUM};'>↑ {fmt_bytes(p.total_tx)}</span>"
         )
+
+
+class BrainView(QWidget):
+    """GUI render of `panels/brain.py:BrainPanel`. Same data model as the
+    TUI: state, model, top apps, last event. Uses the panel's `update()`
+    snapshot rather than rendering the Rich Text it produces (TUI-only).
+
+    Parity with TUI:
+      Line 1:  STATE <state>   MODEL <name>   q=N
+      Line 2:  HOST  <one-liner machine summary>
+      Line 3:  KNOWS most-used apps (7d):
+      Line 4+: <name>   <hours>h   gpu <bar>
+      Line N:  LAST  <event-name> (severity)  <ts>
+    """
+
+    STATE_COLORS = {
+        "THINKING":  "#e6c84a",   # yellow
+        "STREAMING": "#7CFC00",   # bright_green
+        "IDLE":      "#33b033",   # medium green
+        "ERROR":     "#cc1a1a",   # red
+        "DISABLED":  "#7f7f7f",   # dim
+        "UNKNOWN":   "#7f7f7f",
+    }
+
+    def __init__(self, brain_panel, parent=None):
+        super().__init__(parent)
+        self.panel = brain_panel
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        self._label = QLabel("")
+        self._label.setFont(_mono(9))
+        self._label.setTextFormat(Qt.TextFormat.RichText)
+        self._label.setStyleSheet(f"color: {MEDIUM};")
+        self._label.setAlignment(
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self._label.setWordWrap(False)
+        layout.addWidget(self._label, stretch=1)
+
+    def refresh(self):
+        from panels.brain import _looks_like_real_app
+        bp = self.panel
+        state = getattr(bp, "_state", "UNKNOWN") or "UNKNOWN"
+        last_event = getattr(bp, "_last_event", None)
+        client = getattr(bp, "_client", {}) or {}
+        memory = getattr(bp, "_memory", None)
+
+        state_color = self.STATE_COLORS.get(state, DIM)
+        model = client.get("model") or "—"
+        short_model = model.split(":")[0] if ":" in model else model
+        qd = client.get("queue_depth") or 0
+        qstr = (f"  <span style='color:#e6c84a;'>q={qd}</span>"
+                if qd else "")
+
+        lines = [
+            f"<span style='color:{DIM};'>STATE </span>"
+            f"<span style='color:{state_color}; font-weight:bold;'>{state:<10}</span>"
+            f"<span style='color:{DIM};'>MODEL </span>"
+            f"<span style='color:{ACCENT}; font-weight:bold;'>{short_model}</span>"
+            f"{qstr}"
+        ]
+
+        if memory is not None:
+            try:
+                summary = memory.get_machine_summary()
+            except Exception:
+                summary = None
+            if summary:
+                lines.append(
+                    f"<span style='color:{DIM};'>HOST  </span>"
+                    f"<span style='color:{MEDIUM};'>{self._html_escape(summary)}</span>"
+                )
+
+        top = []
+        if memory is not None:
+            try:
+                top = memory.get_top_apps(n=3) or []
+            except Exception:
+                top = []
+        top = [a for a in top if _looks_like_real_app(a.get("name"))]
+        if top:
+            lines.append(f"<span style='color:{DIM};'>KNOWS most-used apps (7d):</span>")
+            name_w = min(16, max(len(str(a["name"])) for a in top))
+            for a in top:
+                name = str(a["name"])
+                if len(name) > name_w:
+                    name = name[:name_w - 1] + "…"
+                hours = float(a.get("hours") or 0.0)
+                gpu = max(0.0, min(100.0, float(a.get("avg_gpu_when_top") or 0)))
+                bar_len = 5
+                filled = max(0, min(bar_len, int(round(gpu / 100 * bar_len))))
+                bar = "█" * filled + "░" * (bar_len - filled)
+                bar_color = heat_pct(gpu) if gpu >= 30 else DIM
+                lines.append(
+                    f"<span style='color:{DIM};'>  </span>"
+                    f"<span style='color:{ACCENT};'>{name:<{name_w}}</span>  "
+                    f"<span style='color:{MEDIUM};'>{hours:5.1f}h</span>  "
+                    f"<span style='color:{DIM};'>gpu </span>"
+                    f"<span style='color:{bar_color};'>{bar}</span>"
+                )
+        else:
+            lines.append(
+                f"<span style='color:{DIM};'>KNOWS </span>"
+                f"<span style='color:{DIM};'>(still learning — no log data yet)</span>"
+            )
+
+        if last_event:
+            name, severity, ts = last_event
+            sev_color = (heat_pct(95) if severity == "alert"
+                         else heat_pct(60) if severity == "notable"
+                         else DIM)
+            lines.append(
+                f"<span style='color:{DIM};'>LAST  </span>"
+                f"<span style='color:{ACCENT}; font-weight:bold;'>{self._html_escape(name)}</span>"
+                f"<span style='color:{sev_color};'> ({severity})</span>"
+                f"  <span style='color:{DIM};'>{ts}</span>"
+            )
+        else:
+            lines.append(
+                f"<span style='color:{DIM};'>LAST  </span>"
+                f"<span style='color:{DIM};'>nothing fired yet</span>"
+            )
+
+        # VAULT line: shows the markdown mirror of memory.json. Each page
+        # gets a quick "name (lines)" so you can see at a glance what
+        # Winston has written down without opening the files.
+        vault = getattr(bp, "_vault", {}) or {}
+        if vault.get("exists"):
+            pages = vault.get("pages", []) or []
+            kb = vault.get("total_bytes", 0) / 1024
+            page_strs = " · ".join(
+                f"<span style='color:{MEDIUM};'>{p['name']}</span>"
+                f"<span style='color:{DIM};'>:{p['lines']}</span>"
+                for p in pages
+            )
+            lines.append(
+                f"<span style='color:{DIM};'>VAULT </span>"
+                f"<span style='color:{DIM};'>{vault.get('path', 'vault')}/  "
+                f"({kb:.1f}KB)</span>"
+            )
+            if page_strs:
+                lines.append(
+                    f"<span style='color:{DIM};'>      </span>{page_strs}"
+                )
+        else:
+            lines.append(
+                f"<span style='color:{DIM};'>VAULT </span>"
+                f"<span style='color:{DIM};'>(not built yet)</span>"
+            )
+
+        self._label.setText(
+            f"<div style='line-height:120%;'>{'<br>'.join(lines)}</div>"
+        )
+
+    @staticmethod
+    def _html_escape(s):
+        return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;"))
 
 
 class StatusBarLabel(QLabel):
@@ -1080,6 +1382,9 @@ class WinstonGui(QMainWindow):
 
         row1_container = QWidget()
         row1_container.setLayout(row1)
+        # Cores dictate the height: 16 bars at 11px + chrome ≈ 215.
+        # SYSTEM and MEMORY use line-height tricks below to spread their
+        # content over the same budget so the boxes don't show black gaps.
         row1_container.setFixedHeight(220)
         root.addWidget(row1_container)
 
@@ -1123,13 +1428,15 @@ class WinstonGui(QMainWindow):
 
         row3_container = QWidget()
         row3_container.setLayout(row3)
-        row3_container.setFixedHeight(220)
+        # Sized to fit ~14 process rows + header + frame chrome. Bumped
+        # from 220 so PROCESSES isn't stuck displaying half-empty.
+        row3_container.setFixedHeight(240)
         root.addWidget(row3_container)
 
-        # ── COMMENTARY (LLM streaming) — absorbs leftover vertical ──
-        # Reuses brain.client / brain.prompt / brain.memory unchanged. The
-        # CommentaryView wraps the same state machine we have in the TUI;
-        # only the renderer differs.
+        # ── COMMENTARY (LLM streaming) on top of BRAIN — both full width ──
+        # COMMENTARY absorbs the leftover vertical space (chat log can grow);
+        # BRAIN sits below at a fixed-ish height for diagnostic glance. Both
+        # span full width so neither feels cramped.
         self._commentary = CommentaryView(
             llm_config=self.llm_config,
             memory=self.memory,
@@ -1137,8 +1444,30 @@ class WinstonGui(QMainWindow):
         )
         commentary_frame = PanelFrame("COMMENTARY")
         commentary_frame.body().addWidget(self._commentary)
-        commentary_frame.setMinimumHeight(120)
+        commentary_frame.setMinimumHeight(140)
         root.addWidget(commentary_frame, stretch=1)
+
+        # BRAIN — Winston's internal state. Optional via SHOW_BRAIN_PANEL.
+        # Sized to fit STATE/HOST/KNOWS(3 apps)/LAST without wasted space.
+        self._brain = None
+        self._brain_view = None
+        self._brain_due_at = None
+        if self.llm_config.get("enabled") and self.llm_config.get("show_brain_panel", True):
+            from panels.brain import BrainPanel
+            from brain.client import status as client_status
+            self._brain = BrainPanel(
+                memory=self.memory,
+                get_state=lambda: self._commentary.engine.state,
+                get_last_event=lambda: self._commentary.engine.last_event,
+                client_status=client_status,
+            )
+            self._brain_view = BrainView(self._brain)
+            brain_frame = PanelFrame("BRAIN", accent=True)
+            brain_frame.body().addWidget(self._brain_view)
+            # Tall enough for 8 lines (state, host, knows-header, 3 apps,
+            # last, vault path, vault pages) without crowding out COMMENTARY.
+            brain_frame.setFixedHeight(170)
+            root.addWidget(brain_frame)
 
         # ── ASK input ──
         # Press `/` from anywhere to focus (matches the TUI binding).
@@ -1193,6 +1522,7 @@ class WinstonGui(QMainWindow):
 
         self._status_due_at = now + 1.0
         self._log_due_at = now + 1.0
+        self._brain_due_at = now + 1.0
 
         # ── GPU-busy throttle (mirrors cli/display.py) ──
         # When the GPU is hot from a game, we drop the dashboard's effective
@@ -1286,6 +1616,18 @@ class WinstonGui(QMainWindow):
             self._log_due_at = now + 1.0
             try:
                 self.logger.log(self.sections)
+            except Exception:
+                pass
+
+        # BRAIN panel: 1Hz, dirty-check skip when nothing new.
+        if (self._brain is not None
+                and self._brain_view is not None
+                and now >= self._brain_due_at):
+            self._brain_due_at = now + 1.0
+            try:
+                self._brain.update()
+                if self._brain.is_dirty():
+                    self._brain_view.refresh()
             except Exception:
                 pass
 

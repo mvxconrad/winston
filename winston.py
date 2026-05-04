@@ -43,7 +43,7 @@ sections = [
     (TempsPanel(refresh_sec=config.LHM_FETCH_INTERVAL_SEC), config.TEMPS_HZ),
     (GpuPanel(),                                     config.GPU_HZ),
     (NetworkPanel(),                                 config.NETWORK_HZ),
-    (ProcessesPanel(),                               config.PROCESSES_HZ),
+    (ProcessesPanel(limit=getattr(config, "PROCESSES_LIMIT", 14)), config.PROCESSES_HZ),
 ]
 
 logger = Logger()

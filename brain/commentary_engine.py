@@ -73,6 +73,10 @@ from datetime import datetime
 #
 # Tail the file to watch live:  tail -f logs/reasoning.jsonl
 #
+# A parallel `logs/reasoning.log` is written in human-readable form for
+# the same events — easier on the eye when you're skimming a session
+# without piping through `jq`. The JSONL stays canonical for tooling.
+#
 # Persistent across sessions, with a visible banner written on each
 # launch so you can scan the file (or `grep "WINSTON SESSION"`) to find
 # session boundaries. Rotates to .old when it crosses 50 MB so the file
@@ -95,40 +99,49 @@ REASONING_LOG_PATH = "logs/reasoning.jsonl"
 REASONING_LOG_MAX_BYTES = 50 * 1024 * 1024   # 50 MB
 _SESSION_BANNER_WRITTEN = False
 
+# Human-readable mirror of the JSONL. Same events, pretty-formatted with
+# section breaks and indented prompt bodies. JSONL stays the canonical
+# machine-parseable record; this file exists so a human can scan a session
+# without piping through `jq`. Rotates in lockstep with the JSONL.
+READABLE_LOG_PATH = "logs/reasoning.log"
+READABLE_LOG_MAX_BYTES = 50 * 1024 * 1024
+
 
 def _maybe_rotate():
-    """If the log has grown beyond REASONING_LOG_MAX_BYTES, archive it
-    with today's date in the filename so old logs accumulate over time:
+    """If either log has grown past its max size, archive it with today's
+    date in the filename so old logs accumulate over time:
 
-        reasoning.jsonl                       (current, always this name)
-        reasoning-2026-04-12.jsonl            (archived 2026-04-12)
-        reasoning-2026-05-01.jsonl            (archived 2026-05-01)
-        reasoning-2026-05-04-2.jsonl          (second rotation same day)
+        reasoning.jsonl  / reasoning.log       (current, always this name)
+        reasoning-2026-04-12.jsonl             (archived 2026-04-12)
+        reasoning-2026-05-04-2.jsonl           (second rotation same day)
 
-    Then a fresh reasoning.jsonl starts. Old archives stick around
-    forever; user can delete them manually when they want.
+    Then a fresh log starts. Old archives stick around forever; user can
+    delete them manually when they want.
     """
-    try:
-        if not (os.path.exists(REASONING_LOG_PATH)
-                and os.path.getsize(REASONING_LOG_PATH) > REASONING_LOG_MAX_BYTES):
-            return
-        date = datetime.now().strftime("%Y-%m-%d")
-        base_dir = os.path.dirname(REASONING_LOG_PATH) or "."
-        # First try `reasoning-2026-05-04.jsonl`; if that exists (we
-        # rotated earlier today), bump a counter until we find a free name.
-        for n in range(100):
-            suffix = f"-{date}.jsonl" if n == 0 else f"-{date}-{n+1}.jsonl"
-            candidate = os.path.join(base_dir, f"reasoning{suffix}")
-            if not os.path.exists(candidate):
-                os.replace(REASONING_LOG_PATH, candidate)
-                return
-    except OSError:
-        pass
+    for path, max_bytes, ext in (
+            (REASONING_LOG_PATH, REASONING_LOG_MAX_BYTES, "jsonl"),
+            (READABLE_LOG_PATH,  READABLE_LOG_MAX_BYTES,  "log")):
+        try:
+            if not (os.path.exists(path)
+                    and os.path.getsize(path) > max_bytes):
+                continue
+            date = datetime.now().strftime("%Y-%m-%d")
+            base_dir = os.path.dirname(path) or "."
+            for n in range(100):
+                suffix = (f"-{date}.{ext}" if n == 0
+                          else f"-{date}-{n+1}.{ext}")
+                candidate = os.path.join(base_dir, f"reasoning{suffix}")
+                if not os.path.exists(candidate):
+                    os.replace(path, candidate)
+                    break
+        except OSError:
+            continue
 
 
 def _ensure_session_banner():
-    """Write the per-session header on first trace call of this process.
-    Idempotent — safe to call from every `_trace`."""
+    """Write the per-session header on first trace call of this process,
+    in BOTH the JSONL and the human-readable .log. Idempotent — safe to
+    call from every `_trace`."""
     global _SESSION_BANNER_WRITTEN
     if _SESSION_BANNER_WRITTEN:
         return
@@ -152,17 +165,102 @@ def _ensure_session_banner():
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
     except OSError:
         pass
+    try:
+        os.makedirs(os.path.dirname(READABLE_LOG_PATH) or ".", exist_ok=True)
+        with open(READABLE_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write("\n")
+            f.write(banner + "\n")
+            f.write(title + "\n")
+            f.write(banner + "\n\n")
+    except OSError:
+        pass
+
+
+def _format_readable(event):
+    """Format a trace event as a multi-line, human-readable block.
+
+    Mirrors the JSONL data — same fields, but laid out for the eye.
+    Returns a string (already newline-terminated)."""
+    ts = event.get("t", "")
+    # Just the HH:MM:SS portion of the ISO timestamp (full date is in
+    # the session banner above).
+    if "T" in ts:
+        ts_short = ts.split("T", 1)[1]
+    else:
+        ts_short = ts
+
+    kind = event.get("kind", "?")
+
+    def _indent(s, prefix="    "):
+        if s is None:
+            return prefix + "(none)"
+        # Already-stringified; just indent each line.
+        return "\n".join(prefix + line for line in str(s).splitlines())
+
+    if kind == "session_start":
+        # Banner already covers session_start visually.
+        return ""
+
+    if kind == "prompt":
+        trigger = event.get("trigger", "?")
+        tier = event.get("tier", "?")
+        model = event.get("model", "?")
+        head = (f"[{ts_short}] PROMPT  {trigger}  "
+                f"({tier} · {model})")
+        out = [head]
+        sys_text = event.get("system")
+        if sys_text:
+            out.append("  SYSTEM:")
+            out.append(_indent(sys_text))
+        user_text = event.get("user")
+        if user_text:
+            out.append("  USER:")
+            out.append(_indent(user_text))
+        return "\n".join(out) + "\n\n"
+
+    if kind == "response":
+        trigger = event.get("trigger", "?")
+        elapsed = event.get("elapsed_sec", "?")
+        text = event.get("text", "")
+        head = f"[{ts_short}] RESPONSE  {trigger}  ({elapsed}s)"
+        return head + "\n" + _indent(text, "  > ") + "\n\n"
+
+    if kind == "trigger_fired":
+        name = event.get("name", "?")
+        sev = event.get("severity", "?")
+        desc = event.get("description", "")
+        return (f"[{ts_short}] TRIGGER  {name}  ({sev})\n"
+                f"  {desc}\n\n")
+
+    if kind == "error":
+        trigger = event.get("trigger", "?")
+        elapsed = event.get("elapsed_sec", "?")
+        return f"[{ts_short}] ERROR    {trigger}  ({elapsed}s)\n\n"
+
+    # Fallback — show the raw fields for any new event kinds.
+    extras = ", ".join(f"{k}={v}" for k, v in event.items()
+                       if k not in ("t", "kind"))
+    return f"[{ts_short}] {kind.upper()}  {extras}\n\n"
 
 
 def _trace(event):
-    """Append one JSON event to the reasoning log. Best-effort — never
-    raises so a failed write can't break commentary."""
+    """Append one event to BOTH the JSONL (canonical) and the human-readable
+    .log mirror. Best-effort — never raises so a failed write can't break
+    commentary."""
     _ensure_session_banner()
+    event = {"t": datetime.now().isoformat(timespec="seconds"), **event}
     try:
         os.makedirs(os.path.dirname(REASONING_LOG_PATH) or ".", exist_ok=True)
-        event = {"t": datetime.now().isoformat(timespec="seconds"), **event}
         with open(REASONING_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+    try:
+        readable = _format_readable(event)
+        if readable:
+            os.makedirs(os.path.dirname(READABLE_LOG_PATH) or ".", exist_ok=True)
+            with open(READABLE_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(readable)
     except OSError:
         pass
 
