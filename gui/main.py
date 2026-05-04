@@ -115,6 +115,7 @@ class HeatBar(QProgressBar):
         self.setTextVisible(False)
         self.setFixedHeight(height)
         self._max_val = max_val
+        self._last_color = None
         self._apply(0)
 
     def setValue(self, value):
@@ -123,7 +124,13 @@ class HeatBar(QProgressBar):
         self._apply(v / self._max_val * 100 if self._max_val else 0)
 
     def _apply(self, pct):
+        # Dirty-check: setStyleSheet triggers a reflow + repaint of the
+        # entire widget, so skip when the heat color hasn't changed.
+        # Saves a bunch of work on the 16-core CORES grid + temp bars.
         color = heat_pct(pct)
+        if color == self._last_color:
+            return
+        self._last_color = color
         self.setStyleSheet(f"""
             QProgressBar {{
                 background: #0a1a0a;
@@ -161,13 +168,26 @@ class CpuGraphView(QWidget):
         self._plot = pg.PlotWidget()
         self._plot.setBackground(BG)
         self._plot.setYRange(0, 100, padding=0)
+        self._plot.setXRange(0, self.HISTORY_SECONDS * self.HISTORY_HZ, padding=0)
         self._plot.setMouseEnabled(x=False, y=False)
-        self._plot.showGrid(x=False, y=True, alpha=0.15)
-        self._plot.getAxis('left').setPen(DIM)
-        self._plot.getAxis('left').setTextPen(DIM)
-        self._plot.getAxis('bottom').setPen(DIM)
-        self._plot.getAxis('bottom').setTextPen(DIM)
+        self._plot.setMenuEnabled(False)
+        self._plot.hideButtons()
+
+        # Disable autorange — fixed 0–100 Y, fixed-width X. AxisItem.paint
+        # is the single biggest CPU cost in the GUI when these are on
+        # because pyqtgraph recomputes tick layout every paint.
+        self._plot.enableAutoRange(False, False)
+
+        # Hide both axes entirely. The Y label ("100%") and X label
+        # ("-120s / now") are part of the panel chrome from PanelFrame,
+        # not the axis. If you ever want them rendered by pyqtgraph again,
+        # un-hide left and pin its tick spacing with setTickSpacing(25, 25).
+        self._plot.hideAxis('left')
         self._plot.hideAxis('bottom')
+
+        # Grid via the plot's gridlines costs render time too — skip it.
+        # If you want gridlines back later, add them as static InfiniteLine
+        # items rather than enabling showGrid (which goes through AxisItem).
         layout.addWidget(self._plot, stretch=1)
 
         # Two curves: filled area underneath in cool color, line on top
@@ -177,19 +197,36 @@ class CpuGraphView(QWidget):
             fillLevel=0, brush=pg.mkBrush(124, 252, 0, 60),
         )
 
+        # Cache state for dirty-checking — avoid setData / setPen calls
+        # when nothing actually changed.
+        self._last_sig = None
+        self._last_pen_color = None
+
     def refresh(self):
         history = list(self.panel.history)[-self.HISTORY_SECONDS * self.HISTORY_HZ:]
         if not history:
             return
-        x = list(range(len(history)))
-        self._curve.setData(x, history)
+
+        # Dirty-check: only push to the curve when the data actually
+        # changed. Curve.setData triggers a repaint every call regardless
+        # of whether values differ, so without this we redraw at the
+        # frame rate even when CpuGraphPanel is still on its last sample.
+        n = len(history)
+        sig = (n, history[-1], history[0])
+        if sig != self._last_sig:
+            x = list(range(n))
+            self._curve.setData(x, history)
+            self._last_sig = sig
 
         cur = self.panel.last_value
         avg = self.panel.average
         peak = self.panel.peak
         color = heat_pct(cur)
-        # Line color tracks current load — same heat semantic as the bars.
-        self._curve.setPen(pg.mkPen(color, width=2))
+
+        # setPen also triggers a repaint — skip if heat band unchanged.
+        if color != self._last_pen_color:
+            self._curve.setPen(pg.mkPen(color, width=2))
+            self._last_pen_color = color
 
         self._readout.setText(
             f"<span style='color:{color}; font-weight:bold;'>{cur:5.1f}%</span>"
@@ -210,6 +247,8 @@ class CoresView(QWidget):
         self._grid.setContentsMargins(0, 0, 0, 0)
         self._grid.setSpacing(1)
         self._rows = []  # list of (label, bar, value_label) per core
+        self._last_pcts = []
+        self._last_colors = []
 
     def refresh(self):
         values = self.panel.values
@@ -237,15 +276,22 @@ class CoresView(QWidget):
             # stay packed at the top of the panel rather than spreading
             # out.
             self._grid.addStretch(1)
+            self._last_pcts = [-1] * len(values)
+            self._last_colors = [None] * len(values)
 
-        for (idx_label, bar, val_label), v in zip(self._rows, values):
-            bar.setValue(v)
+        for i, ((idx_label, bar, val_label), v) in enumerate(zip(self._rows, values)):
+            pct_int = int(round(v))
+            # Dirty-check per-row: only touch the widgets if the integer
+            # percent actually changed. Cuts setText / setStyleSheet calls
+            # on idle cores down to ~zero.
+            if pct_int != self._last_pcts[i]:
+                bar.setValue(v)
+                val_label.setText(f"{pct_int:>3d}%")
+                self._last_pcts[i] = pct_int
             color = heat_pct(v)
-            # Right-pad the integer to 3 chars so 5 / 16 / 100 all line
-            # up at the right edge instead of dancing one char left/right
-            # depending on digit count.
-            val_label.setText(f"{int(round(v)):>3d}%")
-            val_label.setStyleSheet(f"color: {color};")
+            if color != self._last_colors[i]:
+                val_label.setStyleSheet(f"color: {color};")
+                self._last_colors[i] = color
 
 
 class MemoryView(QWidget):
@@ -753,10 +799,21 @@ class NetworkView(QWidget):
         layout.addWidget(self._totals)
         layout.addStretch(1)
 
+        # Dirty-check caches for the curves — rates rarely change at the
+        # frame rate, so dirty-checking these matters even though the
+        # mini-plots are smaller than the CPU graph.
+        self._last_rx_sig = None
+        self._last_tx_sig = None
+
     def _make_mini_plot(self):
         plot = pg.PlotWidget()
         plot.setBackground(BG)
         plot.setMouseEnabled(x=False, y=False)
+        plot.setMenuEnabled(False)
+        plot.hideButtons()
+        # Mini plots: leave Y autorange ON (rates aren't bounded), but
+        # everything else off. AxisItem.paint cost is much smaller here
+        # because both axes are hidden — they don't lay out tick text.
         plot.hideAxis('bottom')
         plot.hideAxis('left')
         plot.setFixedHeight(28)
@@ -773,9 +830,15 @@ class NetworkView(QWidget):
         rx_hist = list(p.rx_history)[-self.HISTORY_POINTS:]
         tx_hist = list(p.tx_history)[-self.HISTORY_POINTS:]
         if rx_hist:
-            self._down_curve.setData(list(range(len(rx_hist))), rx_hist)
+            sig = (len(rx_hist), rx_hist[-1])
+            if sig != self._last_rx_sig:
+                self._down_curve.setData(list(range(len(rx_hist))), rx_hist)
+                self._last_rx_sig = sig
         if tx_hist:
-            self._up_curve.setData(list(range(len(tx_hist))), tx_hist)
+            sig = (len(tx_hist), tx_hist[-1])
+            if sig != self._last_tx_sig:
+                self._up_curve.setData(list(range(len(tx_hist))), tx_hist)
+                self._last_tx_sig = sig
 
         self._down_text.setText(
             f"<span style='color:{BRIGHT}; font-weight:bold;'>DOWN</span> "
