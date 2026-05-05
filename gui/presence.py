@@ -1,0 +1,733 @@
+"""Winston's presence face — small orb + voice loop, full Winston brain.
+
+This is the *default* way to run Winston. The dashboard (gui/main.py) is
+the same brain with a numbers face on it; presence is the same brain
+with a voice + tiny orb. Both share the orchestrator: panels tick,
+triggers fire, memory learns, log writes.
+
+Layout:
+  - `gui/orb.py`            — the visual itself. Reusable.
+  - `PresenceWindow`         — small window: orb + caption strip.
+  - `PresenceFace`           — controller: owns CommentaryEngine, routes
+                               its output to TTS instead of a typewriter
+                               panel.
+  - `run()`                  — winston.py entry.
+
+Design rules:
+- Same llm_config + memory bootstrap as gui.main.run / cli.display.run —
+  Winston is identical regardless of face.
+- Triggers fire whether or not anyone's looking. Heartbeat speaks aloud.
+  ARK busy speaks aloud. Memory updates from spoken replies just like
+  text replies.
+- One QApplication. F11 toggles fullscreen. Ctrl+Q quits from anywhere.
+"""
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+
+import psutil
+
+from PyQt6.QtCore import (
+    Qt, QTimer, QObject, QPoint, pyqtSignal,
+)
+from PyQt6.QtGui import QKeyEvent, QMouseEvent
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QPushButton, QVBoxLayout, QWidget,
+)
+
+from .orb import Orb
+
+
+# ──────────────── Voice ↔ UI bridge (thread marshaling) ────────────────
+class _PresenceBridge(QObject):
+    """Voice + LLM callbacks run on worker threads. Qt signals queue
+    them onto the UI thread for safe widget updates. Same role as the
+    LlmBridge / VoiceBridge in gui/main.py.
+
+    Why every callback into Qt-touching code goes through a signal:
+    QTimer / QObject mutation MUST happen on the thread the object was
+    created on. Calling QTimer.start from the speaker's drain callback
+    (a fresh worker thread) raises 'Timers cannot be started from
+    another thread' and leaves the event loop in a bad state — that's
+    what made the second voice response feel laggy. Routing through
+    pyqtSignal forces the slot to run on the UI thread.
+    """
+    state_changed = pyqtSignal(str)
+    user_text     = pyqtSignal(str)
+    winston_text  = pyqtSignal(str)
+    error         = pyqtSignal(str)
+    chunk         = pyqtSignal(str)
+    done          = pyqtSignal(str)
+    llm_error     = pyqtSignal()
+    # Fired when speech finishes (TTS playback drained). The speaker
+    # callback runs on PortAudio's thread; we use this signal to hop
+    # back to the UI thread before mutating engine state or restarting
+    # the trigger QTimer.
+    speech_done   = pyqtSignal()
+
+
+# ──────────────── The window ────────────────
+class PresenceWindow(QMainWindow):
+    """Floating Winston orb. Frameless, transparent, always-on-top.
+
+    Just the circle — no caption, no chrome by default. The orb shows
+    its own state via color + amplitude pulse, and the WINSTON name is
+    rendered inside the orb body (see gui/orb.py). All other UI is
+    hover-only:
+
+      Hover      → close (×) + minimize (−) buttons fade in top-right
+      Drag       → click + move anywhere; the whole window follows
+      Double-click → opens the dashboard (gui/main.py) as a separate
+                     process so the orb keeps running alongside it
+      Hold space → push-to-talk (same as before)
+      J          → opens the dashboard (alternative to double-click)
+      Ctrl+Q     → quit
+
+    Why frameless + always-on-top:
+      The orb is meant to be a *presence* on your screen, not a panel
+      to be looked at. You glance over, see the state color, talk to
+      Winston, glance back at your work. A title bar + taskbar row
+      breaks that feel.
+    """
+
+    KEY_TALK = Qt.Key.Key_Space
+    KEY_DASHBOARD = Qt.Key.Key_J
+    HOVER_FADE_MS = 180   # how long enter/leave hover-control fade lasts
+
+    def __init__(self, voice_engine, face, parent=None):
+        super().__init__(parent)
+        self.engine = voice_engine
+        self.face = face
+
+        # Frameless + always-on-top + translucent so only the orb is
+        # visible. WA_TranslucentBackground lets the rounded orb edges
+        # blend with whatever's behind the window.
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setWindowTitle("Winston")
+        self.resize(280, 280)
+        # Track mouse so enterEvent / leaveEvent fire even when the
+        # button isn't pressed. Without this, hover state is unreliable
+        # on some Wayland compositors.
+        self.setMouseTracking(True)
+
+        # ── Central widget = the orb ──
+        # The orb fills the window. We make the orb mouse-transparent so
+        # all mouse events (drag, double-click) reach PresenceWindow's
+        # handlers — otherwise the orb's QWidget would swallow them.
+        central = QWidget()
+        central.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        central.setMouseTracking(True)
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self._orb = Orb(
+            get_state=lambda: self.engine.state,
+            get_amplitude=lambda: self.engine.amplitude(),
+        )
+        # Make the orb invisible to the mouse so clicks fall through
+        # to the window. We still SEE it; the hit-testing layer is
+        # transparent.
+        self._orb.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        layout.addWidget(self._orb)
+
+        # ── Hover controls (close + minimize) ──
+        # Two tiny round buttons in the top-right corner. Hidden by
+        # default; fade in on enter, out on leave.
+        btn_style = """
+            QPushButton {
+                color: rgba(220, 220, 220, 230);
+                background: rgba(20, 20, 20, 200);
+                border: 1px solid rgba(120, 120, 120, 120);
+                border-radius: 11px;
+                font-family: monospace;
+                font-size: 14px;
+                font-weight: bold;
+                padding: 0;
+            }
+            QPushButton:hover {
+                color: white;
+                background: rgba(70, 70, 70, 230);
+                border-color: rgba(180, 180, 180, 200);
+            }
+        """
+        self._close_btn = QPushButton("×", self)
+        self._close_btn.setFixedSize(22, 22)
+        self._close_btn.setStyleSheet(btn_style)
+        self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._close_btn.clicked.connect(self.close)
+        self._close_btn.hide()
+
+        self._min_btn = QPushButton("−", self)
+        self._min_btn.setFixedSize(22, 22)
+        self._min_btn.setStyleSheet(btn_style)
+        self._min_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._min_btn.clicked.connect(self.showMinimized)
+        self._min_btn.hide()
+
+        # Drag state — populated on press, consumed on move/release.
+        self._drag_origin: Optional[QPoint] = None
+
+        # ── Bridge wiring (unchanged from the captioned version) ──
+        self._bridge = _PresenceBridge()
+        self._bridge.state_changed.connect(self._on_state)
+        self._bridge.error.connect(self._on_error)
+        # LLM stream signals — face routes brain.client callbacks here.
+        self._bridge.chunk.connect(self.face.on_llm_chunk)
+        self._bridge.done.connect(self.face.on_llm_done)
+        self._bridge.llm_error.connect(self.face.on_llm_error)
+
+        # Hook voice engine callbacks → bridge signals.
+        self.engine.on_state_change = self._bridge.state_changed.emit
+        # No caption to update — voice engine.on_user_text / on_winston_text
+        # are intentionally unwired in this UI. (Brain still records
+        # them via memory.json + history; we just don't show them.)
+        self.engine.on_user_text = lambda _t: None
+        self.engine.on_winston_text = lambda _t: None
+        self.engine.on_error = self._bridge.error.emit
+
+        # Tell the face about the bridge so it can emit chunk/done from
+        # brain.client's worker threads safely.
+        self.face.set_bridge(self._bridge)
+
+        self._talk_held = False
+        self._reposition_controls()
+
+    # ──────────────── Hover control layout ────────────────
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reposition_controls()
+
+    def _reposition_controls(self):
+        # Top-right corner, with a small inset margin.
+        inset = 8
+        spacing = 6
+        x = self.width() - self._close_btn.width() - inset
+        y = inset
+        self._close_btn.move(x, y)
+        self._min_btn.move(x - self._min_btn.width() - spacing, y)
+
+    def enterEvent(self, event):
+        self._close_btn.show()
+        self._min_btn.show()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._close_btn.hide()
+        self._min_btn.hide()
+        super().leaveEvent(event)
+
+    # ──────────────── Drag (frameless window has no title bar) ────────
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            # Wayland compositors REFUSE manual window.move() — security
+            # rule, clients can't position themselves arbitrarily. The
+            # right API is QWindow.startSystemMove(), which delegates the
+            # drag to the compositor. Works on Wayland, Windows, and X11
+            # (X11 uses _NET_WM_MOVERESIZE under the hood). If for some
+            # reason it returns False we fall back to manual move so
+            # we still drag on platforms that don't expose the API.
+            wh = self.windowHandle()
+            if wh is not None and wh.startSystemMove():
+                event.accept()
+                return
+            # Fallback: capture origin for manual move in mouseMoveEvent.
+            self._drag_origin = (
+                event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            )
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        # Manual-move fallback path. Most of the time startSystemMove
+        # took over and we never get here.
+        if (self._drag_origin is not None
+                and (event.buttons() & Qt.MouseButton.LeftButton)):
+            self.move(event.globalPosition().toPoint() - self._drag_origin)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_origin = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        # Double-click anywhere on the orb / window opens the dashboard.
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._open_dashboard()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    # ──────────────── Bridge slots ────────────────
+    def _on_state(self, _state: str):
+        # No caption to update; the orb already shifts color.
+        # Kept as a hook in case we add subtle window-level effects
+        # later (e.g. a colored border tint at peak amplitude).
+        pass
+
+    def _on_error(self, msg: str):
+        # No caption strip in this UI. Errors land in stdout via
+        # voice_engine's [voice] ERROR print so dev still sees them.
+        # Could surface as a brief red tint on the orb — left for later.
+        print(f"[presence] error: {msg}", flush=True)
+
+    # ──────────────── Dashboard launch ────────────────
+    def _open_dashboard(self):
+        """Spawn the dashboard as a separate process so the orb stays
+        present while the dashboard runs alongside it.
+
+        Two processes share memory.json (last-write-wins on save). For
+        v1 this is fine — the dashboard's commentary loop and the orb's
+        commentary loop tick independently. Future: unify into one
+        process with a face-switch toggle.
+        """
+        import subprocess
+        import sys
+        try:
+            entry = str(Path(__file__).resolve().parent.parent / "winston.py")
+            subprocess.Popen([sys.executable, entry, "--gui"])
+        except Exception as e:
+            print(f"[presence] failed to launch dashboard: {e!r}", flush=True)
+
+    # ──────────────── Keys ────────────────
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.isAutoRepeat():
+            return
+        key = event.key()
+        mods = event.modifiers()
+        # Ctrl+Q from anywhere — quit. Matches the dashboard hotkey.
+        if key == Qt.Key.Key_Q and (mods & Qt.KeyboardModifier.ControlModifier):
+            self.close()
+            return
+        if key == self.KEY_TALK:
+            if not self._talk_held:
+                self._talk_held = True
+                self.engine.start_listening()
+            return
+        if key == self.KEY_DASHBOARD:
+            self._open_dashboard()
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event: QKeyEvent):
+        if event.isAutoRepeat():
+            return
+        if event.key() == self.KEY_TALK and self._talk_held:
+            self._talk_held = False
+            self.engine.stop_listening()
+            return
+        super().keyReleaseEvent(event)
+
+
+# ──────────────── PresenceFace — the controller ────────────────
+class PresenceFace:
+    """The brain wiring for presence mode.
+
+    Owns:
+      - CommentaryEngine (the same brain GUI/CLI use)
+      - 1Hz trigger tick
+      - LLM stream wiring → engine.on_chunk/on_done/on_error
+      - Bridge-aware speak path: when a stream finishes, finalize the
+        engine (marker parsing, memory writes, history) and hand the
+        final text to VoiceEngine.speak_text. When playback drains,
+        release the engine cooldown so the next event can fire.
+
+    Doesn't own any widgets. The window holds the bridge; the face just
+    needs a reference to it so it can route brain.client's worker-thread
+    callbacks safely onto the UI thread.
+    """
+
+    def __init__(self, voice_engine, llm_config, memory, sections):
+        self.voice = voice_engine
+        from brain.commentary_engine import CommentaryEngine
+        self.engine = CommentaryEngine(sections, llm_config or {}, memory)
+        self.sections = sections
+
+        self._bridge: Optional[_PresenceBridge] = None
+
+        # 1Hz tick. The Qt timer is created on bridge attach so the face
+        # is constructible without a running QApplication (test mode).
+        self._trigger_timer: Optional[QTimer] = None
+
+        # Wire VoiceEngine's push-to-talk to route through OUR brain. The
+        # engine sets state THINKING after STT and waits; we handle the
+        # rest (LLM via CommentaryEngine, then TTS via voice.speak_text).
+        self.voice.on_user_text_complete = self.handle_user_speech
+
+    # ──────────────── Setup ────────────────
+    def set_bridge(self, bridge: _PresenceBridge):
+        """Called by PresenceWindow at construction. Lets brain.client's
+        worker threads emit chunk/done/error onto the UI thread."""
+        self._bridge = bridge
+        # Now we have a Qt context — set up the trigger ticker.
+        self._trigger_timer = QTimer()
+        self._trigger_timer.timeout.connect(self._trigger_tick)
+        # Marshal speech-finished onto the UI thread. The speaker's
+        # drain callback runs on PortAudio's thread; mutating engine
+        # state or restarting QTimers from there crashes Qt's timer
+        # subsystem ("Timers cannot be started from another thread").
+        bridge.speech_done.connect(self._on_speech_done_ui)
+
+    def start(self):
+        """Begin Winston's regular loop.
+
+        Two paths, controlled by `config.STARTUP_GREETING`:
+          - Greeting on  → fire the greeting prompt immediately ("Good
+            afternoon, max" or similar). When that finishes speaking,
+            the post-speech callback drops us into the regular trigger
+            loop. Skips the GUI's longer "retrospective" step — voice
+            mode wants short.
+          - Greeting off → straight into trigger loop, no opening line.
+
+        The trigger timer only starts AFTER the greeting plays so we
+        don't fire a heartbeat observation on top of "Good afternoon".
+        """
+        if self.engine.state == "DISABLED":
+            return
+        if self.engine.config.get("startup_greeting", True):
+            self.engine.startup_step = "greeting"
+            system, prompt, tier = self.engine.build_greeting()
+            if system is None:
+                # Greeting builder bailed (no memory? no LLM?) — skip
+                # straight to regular loop instead of getting stuck.
+                self._begin_regular_loop()
+                return
+            self._fire_stream(system, prompt, tier)
+        else:
+            self._begin_regular_loop()
+
+    def _begin_regular_loop(self):
+        """Init triggers and start the 1Hz tick. Idempotent — safe to
+        call from either the post-greeting hook or directly from
+        start()."""
+        self.engine.startup_step = None
+        self.engine.init_triggers()
+        if self._trigger_timer is not None and not self._trigger_timer.isActive():
+            self._trigger_timer.start(1000)
+
+    # ──────────────── User-driven path ────────────────
+    def handle_user_speech(self, text: str):
+        """Voice engine just transcribed `text`. Route through the
+        commentary engine's conversational path so memory + tiered
+        models + history all apply, exactly like the dashboard's ASK
+        input would.
+
+        Called from VoiceEngine's worker thread — we marshal to the UI
+        thread via the bridge so commentary engine state isn't touched
+        cross-thread. Concretely: we ask brain.client to async-stream;
+        its callbacks (also worker-thread) hop through bridge signals
+        to the engine on the UI thread.
+        """
+        recorded = self.engine.handle_user_question(text)
+        if recorded is None:
+            return
+        system, prompt, tier = self.engine.build_conversational(recorded)
+        if system is None:
+            return
+        self._fire_stream(system, prompt, tier)
+
+    # ──────────────── Trigger-driven path ────────────────
+    def _trigger_tick(self):
+        """1Hz: ask the engine if there's anything worth saying. If there
+        is, fire a stream. Engine handles cooldown, busy-state, severity
+        preemption — we just relay."""
+        result = self.engine.evaluate_triggers()
+        if result is None:
+            return
+        kind, payload = result
+        if kind == "event":
+            system, prompt, tier = self.engine.build_triggered(payload)
+        else:
+            system, prompt, tier = self.engine.build_observation()
+        if system is None:
+            return
+        self._fire_stream(system, prompt, tier)
+
+    # ──────────────── Stream wiring ────────────────
+    def _fire_stream(self, system: str, prompt: str, tier: str):
+        from brain.client import generate_stream_async
+        self.engine.begin_streaming()
+        model, keep_alive = self.engine.pick_model(tier)
+        # Latency telemetry — strip these prints once you trust the
+        # numbers. Each line answers a specific question:
+        #   [t] LLM fired       → did the request actually go out fast?
+        #   [t] LLM first chunk → cold-load tax visible here? (3-10s = bad)
+        #   [t] LLM done        → total LLM time
+        #   [t] TTS first audio → time from "speak" to ear
+        # Compare to STT timing logged in voice_engine._run_pipeline.
+        self._t_fire = time.monotonic()
+        self._t_first_chunk: Optional[float] = None
+        self._t_llm_done: Optional[float] = None
+        print(f"[t] LLM fired (model={model}, keep_alive={keep_alive}s, tier={tier})",
+              flush=True)
+        # Bridge signals are queued; safe to emit from brain.client's
+        # worker thread.
+        b = self._bridge
+        generate_stream_async(
+            prompt, system=system, model=model, keep_alive=keep_alive,
+            on_chunk=b.chunk.emit if b else (lambda c: None),
+            on_done=b.done.emit if b else (lambda t: None),
+            on_error=b.llm_error.emit if b else (lambda: None),
+        )
+
+    # Bridge slots — these run on the UI thread.
+    def on_llm_chunk(self, chunk: str):
+        if self._t_first_chunk is None:
+            self._t_first_chunk = time.monotonic()
+            dt = (self._t_first_chunk - self._t_fire) * 1000
+            # First chunk latency — this is where cold-load taxes show
+            # up. Warm 7b: ~200-400ms. Cold-load 7b: 3000-10000ms.
+            print(f"[t] LLM first chunk +{dt:.0f}ms", flush=True)
+        self.engine.on_chunk(chunk)
+
+    def on_llm_done(self, full_text: str):
+        """Stream finished. Force the engine to finalize NOW (instead of
+        waiting for the typewriter to catch up — voice mode has no
+        typewriter). Finalization runs marker parsing, memory writes,
+        and appends to history. We then read history's last entry and
+        TTS it."""
+        self._t_llm_done = time.monotonic()
+        if self._t_fire:
+            dt = (self._t_llm_done - self._t_fire) * 1000
+            print(f"[t] LLM done       +{dt:.0f}ms (full reply)", flush=True)
+        self.engine.on_done(full_text)
+        # Snap the typewriter to the end so the next tick finalizes.
+        self.engine.typed_chars = len(self.engine.streaming_buffer)
+        # Drain any pending markers + push the message into history.
+        self.engine.typewriter_advance()
+        # Pull the just-appended Winston message — that's the cleaned,
+        # marker-stripped text. Falls back to the raw stream if for some
+        # reason history wasn't updated (shouldn't happen).
+        msg = ""
+        if self.engine.history:
+            ts, latest, kind = self.engine.history[-1]
+            if kind == "winston":
+                msg = latest
+        if not msg:
+            # Hop to UI thread via the bridge signal so engine state
+            # mutation and any timer restart happen on the right thread.
+            self._bridge.speech_done.emit()
+            return
+        # speak_text fires its on_done from the speaker callback (a
+        # PortAudio worker thread). We pass the bridge signal's emit
+        # so the actual handler runs on the UI thread, not the audio
+        # thread — see _on_speech_done_ui.
+        self.voice.speak_text(msg, on_done=self._bridge.speech_done.emit)
+
+    def _on_speech_done_ui(self):
+        """Speech finished. Runs on the UI thread (via bridge signal).
+        Release the engine cooldown so the next event can fire. If we
+        just finished the startup greeting, drop into the regular
+        trigger loop — start the QTimer here, where it's legal."""
+        was_greeting = self.engine.startup_step == "greeting"
+        self.engine.end_cooldown()
+        if was_greeting:
+            self._begin_regular_loop()
+
+    def on_llm_error(self):
+        """LLM stream errored. Engine wants to know; voice goes back to
+        IDLE; cooldown released so a follow-up can be tried. If the
+        failed call was the startup greeting, advance past it instead
+        of getting stuck.
+
+        Already on UI thread (bridge.llm_error → here), but we still
+        emit speech_done rather than calling _on_speech_done_ui
+        directly so there's exactly one path that releases cooldown
+        and restarts the timer.
+        """
+        self.engine.on_error()
+        self._bridge.speech_done.emit()
+
+
+# ──────────────── Entry point — winston.py calls this ────────────────
+def run(sections, logger, config=None):
+    """Same signature as gui.main.run / cli.display.run, so winston.py
+    can dispatch by flag without further plumbing.
+
+    Boot sequence:
+      1. Prime panels (one update so first frame has real data).
+      2. Build llm_config + memory (mirror of gui.main.run).
+      3. Build VoiceEngine; warm STT + TTS in background.
+      4. Build PresenceFace + PresenceWindow; wire bridge.
+      5. Start the panel ticker (1Hz across all panels — same data the
+         dashboard reads). Triggers see fresh data, log writes too.
+      6. Start the face's regular loop. Show window. Run Qt.
+
+    The logger ticks via a separate timer at LOGGER_HZ — same as the
+    dashboards. Voice mode is full Winston, not a stripped-down voice
+    toy.
+    """
+    if config is None:
+        import config as default_config
+        config = default_config
+
+    print("WINSTON :: priming sensors...", end=" ", flush=True)
+    psutil.cpu_percent(percpu=True)
+    psutil.cpu_percent()
+    for p in psutil.process_iter():
+        try:
+            p.cpu_percent()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    for panel, _hz in sections:
+        try:
+            panel.update()
+        except Exception:
+            pass
+    print("ready.")
+
+    # llm_config — same shape as gui.main.run() but with voice-mode-only
+    # overrides for keep_alive.
+    #
+    # Why voice mode bumps keep_alive: config.LLM_*_KEEP_ALIVE_SEC = 0
+    # is the right default for the dashboard (Winston speaks every few
+    # minutes — fine to free VRAM between heartbeats). For voice it's
+    # devastating: every push-to-talk pays a 3-10s cold-load tax for
+    # the 7b. After 10 minutes idle the model still unloads, so we
+    # don't permanently squat on VRAM during a game session.
+    voice_keep_alive_sec = 600
+    # Voice mode picks the FAST model for both tiers. The 7b is great
+    # for the dashboard's longer typed answers but costs ~300-500ms more
+    # per reply in voice mode — and that latency is what you feel as
+    # "laggy". 3b's reply quality on short conversational turns is
+    # nearly identical and the latency win is dramatic.
+    voice_model = getattr(config, "LLM_MODEL_FAST", config.LLM_MODEL)
+    llm_config = {
+        "enabled":                 config.LLM_ENABLED,
+        "model":                   voice_model,
+        "use_tiered":              getattr(config, "LLM_USE_TIERED", False),
+        "model_fast":              voice_model,
+        "model_quality":           voice_model,  # collapse tiers in voice
+        "fast_keep_alive_sec":     voice_keep_alive_sec,
+        "quality_keep_alive_sec":  voice_keep_alive_sec,
+        "show_brain_panel":        getattr(config, "SHOW_BRAIN_PANEL", True),
+        "user_name":               config.USER_NAME,
+        "startup_greeting":        config.STARTUP_GREETING,
+        "typewriter_tps":          config.TYPEWRITER_TPS,
+        "inter_message_pause_sec": config.INTER_MESSAGE_PAUSE_SEC,
+        "lines":                   config.COMMENTARY_LINES,
+        "heartbeat_interval_sec":  config.HEARTBEAT_INTERVAL_SEC,
+        "stale_quiet_threshold_sec": config.STALE_QUIET_THRESHOLD_SEC,
+        "triggers":                config.TRIGGERS,
+    }
+
+    # Memory bootstrap — exact mirror of gui.main.run.
+    memory = None
+    if config.LLM_ENABLED:
+        try:
+            from brain.memory import Memory
+            memory = Memory()
+            memory.set_user(name=config.USER_NAME)
+            gpu_panel = next((p for p, _ in sections
+                              if type(p).__name__ == "GpuPanel"), None)
+            ram_panel = next((p for p, _ in sections
+                              if type(p).__name__ == "RamPanel"), None)
+            memory.set_machine_facts(gpu_panel=gpu_panel, ram_panel=ram_panel)
+            memory.learn_from_log(hours=168)
+            memory.save()
+        except Exception as e:
+            print(f"(memory init failed: {e!r} — continuing without it)")
+            memory = None
+
+    # Qt app + voice engine.
+    app = QApplication.instance() or QApplication(sys.argv)
+
+    from brain.voice.voice_engine import VoiceEngine
+    voice = VoiceEngine(
+        sections=[p for p, _ in sections],
+        llm_config=llm_config,
+        memory=memory,
+    )
+    voice.warm_up()
+
+    face = PresenceFace(
+        voice_engine=voice,
+        llm_config=llm_config,
+        memory=memory,
+        sections=sections,
+    )
+
+    window = PresenceWindow(voice_engine=voice, face=face)
+    window.show()
+
+    # Panel ticker — keeps all panels fresh. Triggers + logger read
+    # whatever they tick from. CRITICAL: runs on a daemon worker thread,
+    # NOT a QTimer on the UI thread. ProcessesPanel.update() iterates
+    # psutil.process_iter() which can take 50-200ms — long enough to
+    # block the event loop and cause the orb to skip frames + caption
+    # to stutter. Qt is fine with us mutating panel state from a worker
+    # because the brain reads it via thread-safe attribute reads (no Qt
+    # widgets are touched here).
+    import threading
+
+    panel_stop = threading.Event()
+    last_due = {id(p): 0.0 for p, _ in sections}
+    intervals = {id(p): 1.0 / hz for p, hz in sections}
+
+    def panel_loop():
+        while not panel_stop.is_set():
+            now = time.monotonic()
+            for panel, _hz in sections:
+                pid = id(panel)
+                if now < last_due[pid]:
+                    continue
+                last_due[pid] = now + intervals[pid]
+                try:
+                    panel.update()
+                except Exception:
+                    pass
+                # Tiny GIL yield BETWEEN each panel update. Without
+                # this, a single "iterate every panel" pass holds the
+                # GIL for ~50-150ms (ProcessesPanel.update iterates
+                # psutil.process_iter — Python-side work). PortAudio's
+                # callback thread runs Python code (the speaker
+                # callback) which also needs the GIL; if it can't grab
+                # it for >128ms (one CHUNK_SAMPLES at 16kHz) the
+                # ALSA buffer underruns and Winston stutters.
+                # 1ms sleep is enough to let the audio callback run.
+                time.sleep(0.001)
+            # Sleep just under the fastest panel's period so we don't
+            # over-poll. 200ms is fine — even the snappiest panel
+            # (CPU at 4Hz) only needs an update every 250ms.
+            panel_stop.wait(0.2)
+
+    threading.Thread(target=panel_loop, name="winston-panel-loop",
+                     daemon=True).start()
+
+    # Logger ticks at LOGGER_HZ on its own worker thread — same reason
+    # as the panel loop above (logger.write iterates panels and writes
+    # CSV; non-trivial I/O that doesn't belong on the UI thread).
+    if logger is not None:
+        log_interval_sec = 1.0 / max(0.1, getattr(config, "LOGGER_HZ", 1.0))
+
+        def log_loop():
+            while not panel_stop.is_set():
+                try:
+                    logger.write(sections)
+                except Exception:
+                    pass
+                panel_stop.wait(log_interval_sec)
+
+        threading.Thread(target=log_loop, name="winston-log-loop",
+                         daemon=True).start()
+
+    # Kick off the brain after a short delay so panels have ticked at
+    # least once and the first observation has real data to talk about.
+    QTimer.singleShot(800, face.start)
+
+    app.exec()

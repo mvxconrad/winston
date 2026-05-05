@@ -728,8 +728,13 @@ class WinstonApp(App):
         )
         self._timing_enabled = bool(os.environ.get("WINSTON_TIMING"))
         self._timing_threshold_ms = float(os.environ.get("WINSTON_TIMING_MS", "10"))
-        self._timing_path = os.environ.get("WINSTON_TIMING_LOG",
-                                           "/tmp/winston_timing.log")
+        # Default to OS temp dir so this works on Windows native too
+        # (no /tmp on Windows). Honors WINSTON_TIMING_LOG override.
+        import tempfile
+        self._timing_path = os.environ.get(
+            "WINSTON_TIMING_LOG",
+            os.path.join(tempfile.gettempdir(), "winston_timing.log"),
+        )
         if self._timing_enabled:
             # Truncate the log on each launch so the file reflects this run.
             try:

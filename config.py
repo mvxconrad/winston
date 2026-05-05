@@ -121,6 +121,26 @@ LLM_QUALITY_KEEP_ALIVE_SEC = 0
 # + personalization still work fully; you just don't see the BRAIN panel.
 SHOW_BRAIN_PANEL = True
 
+# ─── Voice subsystem (winston_presence.py) ────────────────
+# Winston's voice mode picks one TTS backend at startup. Piper is local
+# and free but sounds robotic. ElevenLabs Flash is hosted (costs $22/mo
+# Creator) but sounds far more natural and streams chunks back fast.
+#
+# When TTS_PROVIDER == "elevenlabs":
+#   - Reads ELEVENLABS_API_KEY env var (never commit a key to source).
+#   - Sends each Winston reply to ElevenLabs Flash v2.5 with TTS_VOICE_ID.
+#   - On any failure (network, quota, bad key) falls back to Piper so
+#     voice mode never goes mute mid-conversation.
+#   - WINSTON_TTS_VOICE_ID env var overrides TTS_VOICE_ID without editing
+#     this file — handy when trying voices from the Voice Library.
+#
+# Default voice ID is George (premade, British, calm narrator). Any
+# 20-char ID copied from the ElevenLabs Voices dashboard works.
+TTS_PROVIDER = "elevenlabs"        # "piper" | "elevenlabs"
+TTS_VOICE_ID = "zNsotODqUhvbJ5wMG7Ei"   # Charles
+TTS_MODEL_ID = "eleven_flash_v2_5"      # ~75ms first chunk, near-flagship quality
+
+
 # Whether to do the startup ritual on launch:
 #   1. Greeting (time-aware: "Good morning, max." / "Good evening, max." /
 #      "Up late tonight, max?" depending on hour)

@@ -1,0 +1,40 @@
+# Winston runtime dependencies. Pin nothing aggressively — these are
+# all stable APIs we use the basics of, so latest works fine. If a
+# future version breaks something specific, pin THAT package.
+#
+# Install:  pip install -r requirements.txt
+
+# ── GUI ──
+PyQt6
+pyqtgraph
+
+# ── TUI / terminal rendering ──
+rich
+textual
+
+# ── System metrics ──
+psutil
+
+# ── Audio I/O (mic + speaker) ──
+# Cross-platform PortAudio bindings. WASAPI on Windows, ALSA→Pulse on
+# Linux/WSL. The sounddevice import is wrapped at use-site so the rest
+# of Winston still imports if this is missing — but voice mode won't
+# work without it.
+sounddevice
+numpy
+
+# ── Speech-to-text ──
+# faster-whisper is a CTranslate2 port of OpenAI Whisper, ~5x faster
+# than the reference impl. CPU int8 inference is plenty fast for
+# push-to-talk on modern hardware.
+faster-whisper
+
+# ── Text-to-speech (fallback) ──
+# Piper is the local-only fallback. Used when ELEVENLABS_API_KEY isn't
+# set or ElevenLabs is unreachable. Voice quality is robotic-passable.
+piper-tts
+
+# ── Text-to-speech (primary) ──
+# ElevenLabs Flash v2.5 — natural voice, low-latency streaming.
+# Requires ELEVENLABS_API_KEY env var (read from .env).
+elevenlabs

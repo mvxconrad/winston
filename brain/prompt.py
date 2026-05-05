@@ -42,11 +42,20 @@ actually is — RAM at 11% is fine, CPU at 25% is fine.
 
 Comment only on values in the snapshot. Don't invent numbers.
 
-If a YOUR MEMORIES block is present, use it. Apps may have user-told \
-attrs (type=game, feeling=favorite, nickname=Ark) before the auto \
-stats. Prefer the nickname over the canonical name when it exists, \
-and let the type/feeling color how you speak about it. Don't echo the \
-whole `key=value` string — translate it into natural language.
+CRITICAL: only comment on apps that appear in the CURRENT process \
+snapshot. The YOUR MEMORIES section lists apps the user has used in \
+the past — that is HISTORY, not current state. If "ArkAscended" is \
+in YOUR MEMORIES but not in the current process list, the user is \
+NOT playing Ark right now — do not mention it. Mention apps from \
+memory only when (a) they appear in the current process snapshot, \
+or (b) the user is asking you about them.
+
+If a YOUR MEMORIES block is present, use it for context. Apps may \
+have user-told attrs (type=game, feeling=favorite, nickname=Ark) \
+before the auto stats. Prefer the nickname over the canonical name \
+when the app is actually running, and let the type/feeling color \
+how you speak about it. Don't echo the whole `key=value` string — \
+translate it into natural language.
 
 The YOUR MEMORIES header tells you the user's name. The user reading \
 your reply IS that person, so address them as "you" / "your" — never \
@@ -159,7 +168,9 @@ def _personality_block(memory):
 
             app_lines.append(f"  - {head}  ({stats})")
         parts.append(
-            "Apps you use (learned facts FIRST, behavior stats in parens):\n"
+            "Apps the user has used historically (NOT necessarily running "
+            "now — DO NOT mention these unless they appear in the current "
+            "process snapshot below or the user is asking about them):\n"
             + "\n".join(app_lines))
 
     # Free-form notes. Stored in third-person ("max usually codes at
@@ -289,7 +300,21 @@ def summarize_processes(p, memory=None):
 
     Falls back to a single 'Top procs:' line when only Linux side has
     data (non-WSL host or PowerShell unavailable).
+
+    Two important name-handling steps:
+
+    1. Skip the Winston-self process entirely — Winston watching Winston
+       and reporting his own CPU is noise. The dashboard already labels
+       this row [self] for the *human*; the LLM doesn't need to see it.
+    2. Enrich generic interpreter names like "python3" / "node" with the
+       script being run (via panels.processes._enrich_name). Same call
+       the dashboard uses for its display, so the model sees what the
+       user sees: "python3 (myapp.py)" instead of bare "python3".
     """
+    # Lazy import — keeps brain/prompt.py decoupled from panels at module
+    # load time and avoids a circular import surface.
+    from panels.processes import _enrich_name, _WINSTON_PID
+
     has_lin = bool(p.procs)
     has_win = bool(getattr(p, "win_procs", None))
     if not has_lin and not has_win:
@@ -305,29 +330,67 @@ def summarize_processes(p, memory=None):
         except Exception:
             return raw
 
+    def _label(pid, raw_name, is_linux):
+        """Final display label for a process row.
+
+        - Skip self (returns None so caller filters it out).
+        - Enrich generic interpreters using cmdline (Linux only — we
+          have /proc; Windows-host rows came from PowerShell with no
+          cmdline data).
+        - Strip any "[self]" tag _enrich_name appends; it's a UI
+          affordance and means nothing to the model.
+        - Memory-aware nickname substitution.
+        """
+        if is_linux and pid == _WINSTON_PID:
+            return None
+        if is_linux:
+            enriched = _enrich_name(pid, raw_name)
+            if enriched.endswith(" [self]"):
+                return None  # belt-and-suspenders for forked self workers
+            name = enriched
+        else:
+            name = raw_name
+        return _disp(name)
+
+    def _row_parts(rows, is_linux):
+        out = []
+        for cpu, mem, name, pid in rows:
+            label = _label(pid, name, is_linux)
+            if label is None:
+                continue
+            out.append(_format_proc(cpu, mem, label))
+            if len(out) >= 5:
+                break
+        return out
+
     lines = []
 
     if has_lin and has_win:
-        lin_parts = [_format_proc(c, m, _disp(n)) for c, m, n, _ in p.procs[:5]]
-        win_parts = [_format_proc(c, m, _disp(n)) for c, m, n, _ in p.win_procs[:5]]
-        lines.append("Top procs (wsl):     " + ", ".join(lin_parts))
-        lines.append("Top procs (windows): " + ", ".join(win_parts))
+        lin_parts = _row_parts(p.procs, is_linux=True)
+        win_parts = _row_parts(p.win_procs, is_linux=False)
+        if lin_parts:
+            lines.append("Top procs (wsl):     " + ", ".join(lin_parts))
+        if win_parts:
+            lines.append("Top procs (windows): " + ", ".join(win_parts))
     else:
         side = p.procs if has_lin else p.win_procs
-        parts = [_format_proc(c, m, _disp(n)) for c, m, n, _ in side[:5]]
-        label = "Top procs:"
-        # Tag the side when only the Windows-host poller has data —
-        # makes it explicit that Winston is looking at the host, not WSL.
-        if has_win and not has_lin:
-            label = "Top procs (windows):"
-        lines.append(f"{label} " + ", ".join(parts))
+        parts = _row_parts(side, is_linux=has_lin)
+        if parts:
+            label = "Top procs:"
+            if has_win and not has_lin:
+                label = "Top procs (windows):"
+            lines.append(f"{label} " + ", ".join(parts))
 
     # Personalization hook: if the global top process (across both sides)
     # is one of max's frequent apps, inject a one-line behavioral
     # fingerprint. The LLM uses this for smart inferences ("avg 87% GPU
     # when this is top → user's gaming") without hardcoded categories.
+    # Filter Winston-self again — picking top-1 from a list that includes
+    # us would have us tell the user "python3 is one of your frequent
+    # apps" mid-conversation. Embarrassing.
     if memory is not None:
-        merged = list(p.procs) + list(getattr(p, "win_procs", []) or [])
+        lin_filtered = [r for r in p.procs if r[3] != _WINSTON_PID]
+        merged = lin_filtered + list(getattr(p, "win_procs", []) or [])
         if merged:
             merged.sort(key=lambda r: -r[0])
             top_name = merged[0][2]
@@ -558,6 +621,11 @@ weave that into your reply naturally — don't echo the raw key=value, \
 translate it. e.g. if a known game just took the top, mention the \
 nickname instead of the canonical name.
 
+CRITICAL: only mention apps from YOUR MEMORIES if they appear in the \
+trigger description above OR in the current snapshot. Never bring up \
+a historical app (e.g. ArkAscended) unprompted just because it's in \
+memory — that's noise the user doesn't want.
+
 The YOUR MEMORIES header gives the user's name; you're talking TO that \
 person, so use "you" / "your" — never their name in third person.
 
@@ -697,6 +765,12 @@ Never bullet lists.
 
 If the user disputes you ("no", "look again"), re-read the snapshot — \
 your prior answer was probably wrong. KEY FACTS is authoritative.
+
+CRITICAL: only reference apps from YOUR MEMORIES when the user asks \
+about them OR they appear in the current process snapshot. The \
+memory list is HISTORY — what the user has run on this machine over \
+time. It is NOT a list of currently-running apps. Bringing up Ark \
+when Ark isn't running and the user didn't ask about Ark is wrong.
 
 When the user shares something personal you don't already remember, save \
 it by ending with a marker on its own line. Without the marker the fact \
