@@ -105,10 +105,18 @@ class PresenceWindow(QMainWindow):
         # Frameless + always-on-top + translucent so only the orb is
         # visible. WA_TranslucentBackground lets the rounded orb edges
         # blend with whatever's behind the window.
+        #
+        # NOTE: deliberately NO Qt.Tool flag. On Windows, Tool windows
+        # auto-hide when focus shifts elsewhere; combined with Qt's
+        # default quitOnLastWindowClosed=True, the entire app would
+        # exit the moment Windows decided to hide the orb. (We also
+        # set quitOnLastWindowClosed=False in run() as belt-and-
+        # suspenders against this same class of bug.) Tool was
+        # originally added to hide from the Wayland taskbar — that
+        # benefit isn't worth the Windows fragility.
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("Winston")
@@ -164,7 +172,10 @@ class PresenceWindow(QMainWindow):
         self._close_btn.setFixedSize(22, 22)
         self._close_btn.setStyleSheet(btn_style)
         self._close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._close_btn.clicked.connect(self.close)
+        # Explicit QApplication.quit() — we set quitOnLastWindowClosed
+        # to False in run() so window-close alone wouldn't actually
+        # exit the process. The user pressing × means they want OUT.
+        self._close_btn.clicked.connect(QApplication.quit)
         self._close_btn.hide()
 
         self._min_btn = QPushButton("−", self)
@@ -311,8 +322,10 @@ class PresenceWindow(QMainWindow):
         key = event.key()
         mods = event.modifiers()
         # Ctrl+Q from anywhere — quit. Matches the dashboard hotkey.
+        # QApplication.quit() not self.close() — we disabled
+        # quitOnLastWindowClosed in run().
         if key == Qt.Key.Key_Q and (mods & Qt.KeyboardModifier.ControlModifier):
-            self.close()
+            QApplication.quit()
             return
         if key == self.KEY_TALK:
             if not self._talk_held:
@@ -646,6 +659,15 @@ def run(sections, logger, config=None):
 
     # Qt app + voice engine.
     app = QApplication.instance() or QApplication(sys.argv)
+    # Belt-and-suspenders against silent exits on Windows. If the orb's
+    # window ever gets temporarily hidden by the OS (focus shift, Tool
+    # window weirdness, taskbar minimize, etc.), Qt's default behavior
+    # is to quit the event loop the moment the last visible window
+    # closes — even if the window object still exists and could be
+    # re-shown. Disabling that behavior keeps Winston alive across any
+    # window-state shenanigans; the user's explicit Ctrl+Q / × button
+    # is the only way to actually exit.
+    app.setQuitOnLastWindowClosed(False)
 
     from brain.voice.voice_engine import VoiceEngine
     voice = VoiceEngine(
