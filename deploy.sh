@@ -78,6 +78,19 @@ rsync -av --delete \
 echo "    Synced."
 echo
 
+# ──────────────── 1b. Pull Windows logs back to WSL ────────────────
+# Winston runs on Windows, so logs/ and memory.json live there.
+# Pull them back so we can review reasoning traces from WSL.
+echo "==> [1b] Syncing Windows logs → WSL..."
+mkdir -p "${SRC_DIR}/logs"
+if [[ -d "${WIN_DEST}/logs" ]]; then
+    rsync -av "${WIN_DEST}/logs/" "${SRC_DIR}/logs/"
+    echo "    Logs synced."
+else
+    echo "    No Windows logs yet (first deploy?)."
+fi
+echo
+
 # ──────────────── 2. Find Windows Python ────────────────
 echo "==> [2/7] Locating Windows Python..."
 

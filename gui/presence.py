@@ -23,6 +23,7 @@ Design rules:
 """
 from __future__ import annotations
 
+import re
 import sys
 import time
 from pathlib import Path
@@ -499,6 +500,10 @@ class PresenceFace:
         # is constructible without a running QApplication (test mode).
         self._trigger_timer: Optional[QTimer] = None
 
+        # Active SentenceStreamSpeaker while an LLM stream + TTS pipeline
+        # is in flight. None when idle.
+        self._sentence_streamer = None
+
         # Wire VoiceEngine's push-to-talk to route through OUR brain. The
         # engine sets state THINKING after STT and waits; we handle the
         # rest (LLM via CommentaryEngine, then TTS via voice.speak_text).
@@ -588,6 +593,38 @@ class PresenceFace:
         print("[tray] firing greeting stream", flush=True)
         self._fire_stream(system, prompt, tier)
 
+    # ──────────────── Voice commands ────────────────
+    # Regex patterns for voice commands that bypass the LLM entirely.
+    # Each entry is (compiled_regex, handler_method_name).
+    _VOICE_COMMANDS = [
+        (re.compile(
+            r"\b(show|open|pull up|bring up|launch|display)"
+            r"\b.{0,15}\b(dashboard|the dashboard|my dashboard)\b",
+            re.IGNORECASE,
+        ), "_cmd_open_dashboard"),
+    ]
+
+    def _check_voice_commands(self, text: str) -> bool:
+        """Check if `text` matches a voice command. If so, execute it
+        and speak a short confirmation. Returns True if handled."""
+        for pattern, method_name in self._VOICE_COMMANDS:
+            if pattern.search(text):
+                handler = getattr(self, method_name, None)
+                if handler:
+                    handler()
+                    return True
+        return False
+
+    def _cmd_open_dashboard(self):
+        """Voice command: open the dashboard and confirm verbally."""
+        if self._window is not None:
+            self._window._open_dashboard()
+        # Speak a short confirmation without hitting the LLM.
+        self.voice.speak_text(
+            "Opening the dashboard.",
+            on_done=lambda: None,
+        )
+
     # ──────────────── User-driven path ────────────────
     def handle_user_speech(self, text: str):
         """Voice engine just transcribed `text`. Route through the
@@ -601,6 +638,9 @@ class PresenceFace:
         its callbacks (also worker-thread) hop through bridge signals
         to the engine on the UI thread.
         """
+        # Check for voice commands first (dashboard, etc.)
+        if self._check_voice_commands(text):
+            return
         recorded = self.engine.handle_user_question(text)
         if recorded is None:
             return
@@ -660,6 +700,13 @@ class PresenceFace:
         self._t_llm_done: Optional[float] = None
         print(f"[t] LLM fired (model={model}, keep_alive={keep_alive}s, tier={tier})",
               flush=True)
+        # Sentence-streaming TTS: start a SentenceStreamSpeaker that
+        # will receive LLM chunks in on_llm_chunk, fire TTS per
+        # sentence, and play audio through the speaker as sentences
+        # complete — all while the LLM is still generating.
+        self._sentence_streamer = self.voice.speak_streamed(
+            on_done=self._bridge.speech_done.emit,
+        )
         # Bridge signals are queued; safe to emit from brain.client's
         # worker thread.
         b = self._bridge
@@ -679,13 +726,23 @@ class PresenceFace:
             # up. Warm 7b: ~200-400ms. Cold-load 7b: 3000-10000ms.
             print(f"[t] LLM first chunk +{dt:.0f}ms", flush=True)
         self.engine.on_chunk(chunk)
+        # Feed chunk to sentence streamer — it will fire TTS as soon
+        # as a complete sentence accumulates.
+        if self._sentence_streamer is not None:
+            self._sentence_streamer.add_chunk(chunk)
 
     def on_llm_done(self, full_text: str):
-        """Stream finished. Force the engine to finalize NOW (instead of
-        waiting for the typewriter to catch up — voice mode has no
-        typewriter). Finalization runs marker parsing, memory writes,
-        and appends to history. We then read history's last entry and
-        TTS it."""
+        """Stream finished. Finalize the commentary engine (marker
+        parsing, memory writes, history) and flush the sentence streamer
+        so any remaining text gets TTS'd.
+
+        Key difference from the old non-streaming path: we do NOT call
+        voice.speak_text here. The sentence streamer has already been
+        firing TTS per-sentence as the LLM streamed. We just flush
+        whatever partial sentence remained and let the speaker drain
+        naturally. The on_finished callback (wired in _fire_stream)
+        will emit speech_done when all audio has played.
+        """
         self._t_llm_done = time.monotonic()
         if self._t_fire:
             dt = (self._t_llm_done - self._t_fire) * 1000
@@ -695,24 +752,19 @@ class PresenceFace:
         self.engine.typed_chars = len(self.engine.streaming_buffer)
         # Drain any pending markers + push the message into history.
         self.engine.typewriter_advance()
-        # Pull the just-appended Winston message — that's the cleaned,
-        # marker-stripped text. Falls back to the raw stream if for some
-        # reason history wasn't updated (shouldn't happen).
-        msg = ""
-        if self.engine.history:
-            ts, latest, kind = self.engine.history[-1]
-            if kind == "winston":
-                msg = latest
-        if not msg:
-            # Hop to UI thread via the bridge signal so engine state
-            # mutation and any timer restart happen on the right thread.
+
+        # Flush the sentence streamer — sends any remaining buffered
+        # text to TTS and signals the worker to mark_complete the
+        # speaker when done. If no text was generated (empty reply),
+        # the flush sends nothing and mark_complete fires immediately,
+        # which triggers the on_finished → speech_done path.
+        if self._sentence_streamer is not None:
+            self._sentence_streamer.flush()
+            self._sentence_streamer = None
+        else:
+            # Fallback: no streamer (shouldn't happen). Emit speech_done
+            # directly so cooldown still releases.
             self._bridge.speech_done.emit()
-            return
-        # speak_text fires its on_done from the speaker callback (a
-        # PortAudio worker thread). We pass the bridge signal's emit
-        # so the actual handler runs on the UI thread, not the audio
-        # thread — see _on_speech_done_ui.
-        self.voice.speak_text(msg, on_done=self._bridge.speech_done.emit)
 
     def _on_speech_done_ui(self):
         """Speech finished. Runs on the UI thread (via bridge signal).
@@ -747,6 +799,11 @@ class PresenceFace:
         """
         print("[presence] LLM stream errored — check [llm] lines above",
               flush=True)
+        # Cancel any in-flight sentence streamer so it doesn't try to
+        # TTS partial text or leave the speaker in a weird state.
+        if self._sentence_streamer is not None:
+            self._sentence_streamer.cancel()
+            self._sentence_streamer = None
         self.engine.on_error()
         self._bridge.speech_done.emit()
 

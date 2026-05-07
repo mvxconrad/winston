@@ -23,6 +23,14 @@ The orb subscribes to amplitude(): a thread-safe float that reflects the
 engine's current state — speaker RMS while SPEAKING, synthetic pulse
 while THINKING, ambient drift while IDLE.
 
+Sentence-streaming TTS (SentenceStreamSpeaker):
+    Rather than waiting for the full LLM reply then synthesizing all at
+    once, PresenceFace feeds LLM chunks into a SentenceStreamSpeaker.
+    It detects sentence boundaries, fires TTS per sentence (non-streaming
+    to avoid network jitter underruns), and appends each sentence's audio
+    to the speaker as it completes. Time-to-first-audio drops from
+    ~LLM+TTS (~3s) to ~first_sentence_LLM+sentence_TTS (~1s).
+
 What this engine does NOT do:
 - Wake-word detection. v1 is push-to-talk. Add OpenWakeWord later as a
   thin wrapper that calls start_listening() / stop_listening().
@@ -32,6 +40,8 @@ What this engine does NOT do:
 """
 from __future__ import annotations
 
+import queue
+import re
 import threading
 import time
 from datetime import datetime
@@ -131,6 +141,188 @@ def _warm_up_tts():
             _tts_fallback.warm_up()
 
 
+# ──────────────── Sentence-streaming TTS ────────────────
+# Strip memory markers before sending text to TTS. Same regex as
+# commentary_engine._MARKER_RE but we duplicate it here to avoid a
+# circular import (commentary_engine imports from brain.client which
+# imports... it gets messy). The pattern is stable.
+_VOICE_MARKER_RE = re.compile(
+    r"\[(REMEMBER|APP|FORGET)\s*:\s*(.+?)\]",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Planning preambles to detect and skip on the first sentence. Models
+# occasionally emit "Got it! Let me think. Now: ..." before the actual
+# reply. Duplicated from commentary_engine for the same import reason.
+_VOICE_PREAMBLE_RE = re.compile(
+    r"^\s*(?:Got\s+it[!.]?\s+)?"
+    r"(?:Let'?s|Let\s+me|Now,?\s*let'?s|And\s+(?:then\s+)?let'?s|Now\s+I'?ll)\s+"
+    r"(?:think|update|consider|infer|note|address|process|reflect|review|"
+    r"look|see|do|move\s+on|respond)\b"
+    r"[^.\n]*[.\n:]",
+    re.IGNORECASE,
+)
+
+
+class SentenceStreamSpeaker:
+    """Accumulates LLM text chunks and fires TTS per sentence.
+
+    The key latency win: instead of waiting for the entire LLM response
+    before starting TTS, we detect sentence boundaries in the streaming
+    output and fire TTS for each complete sentence while the LLM
+    continues generating. Each sentence uses non-streaming TTS
+    (synthesize, not synthesize_stream) to avoid network-jitter
+    underruns — the same issue that led speak_text to abandon per-chunk
+    streaming.
+
+    Uses SpeakerPlayer's streaming API:
+        play_streaming() → append(chunk) × N → mark_complete()
+
+    Lifecycle (all methods are thread-safe):
+        streamer = SentenceStreamSpeaker(speaker, ...)
+        for each LLM chunk:
+            streamer.add_chunk(text)
+        streamer.flush()       # sends remaining text + signals done
+    """
+
+    # Minimum chars before we'll split at a sentence boundary. Prevents
+    # splitting on "3.5 GB" or "Dr. Smith" and avoids firing TTS for
+    # tiny fragments that would sound choppy.
+    MIN_SENTENCE_LEN = 25
+
+    def __init__(self, speaker: audio_mod.SpeakerPlayer,
+                 on_state_speaking: Callable[[], None],
+                 on_finished: Callable[[], None]):
+        self._speaker = speaker
+        self._on_state_speaking = on_state_speaking
+        self._on_finished = on_finished
+        self._buffer = ""
+        self._queue: queue.Queue = queue.Queue()
+        self._started_speaking = False
+        self._first_sentence = True
+        self._t_start = time.monotonic()
+
+        # Initialize streaming playback — speaker callback will fire
+        # on_finished when all appended audio has drained AND
+        # mark_complete has been called.
+        self._speaker.play_streaming(on_finished=on_finished)
+
+        # Worker thread processes TTS jobs sequentially. One thread is
+        # intentional — serialized TTS means sentences play in order
+        # and we never thrash the ElevenLabs API with parallel calls.
+        self._worker = threading.Thread(
+            target=self._tts_worker, daemon=True,
+            name="winston-sentence-tts",
+        )
+        self._worker.start()
+
+    def add_chunk(self, chunk: str):
+        """Feed a text chunk from the LLM stream. Called from the UI
+        thread (via bridge signal). Checks for sentence boundaries and
+        queues complete sentences for TTS."""
+        self._buffer += chunk
+        self._try_split()
+
+    def flush(self):
+        """LLM is done. Send any remaining buffered text to TTS and
+        signal the worker to finish."""
+        remaining = self._buffer.strip()
+        self._buffer = ""
+        if remaining:
+            self._queue.put(("sentence", remaining))
+        self._queue.put(("done", None))
+
+    def cancel(self):
+        """LLM errored or was interrupted. Drain the queue and clean up
+        without playing anything further."""
+        # Drain the queue
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        self._queue.put(("done", None))
+        self._speaker.stop()
+
+    def _try_split(self):
+        """Check if buffer contains a complete sentence. If so, queue it
+        for TTS and keep the remainder.
+
+        Sentence boundary: [.!?] followed by whitespace, with at least
+        MIN_SENTENCE_LEN chars in the part before the boundary. This
+        handles "3.5" (no space after period) and "Dr." (usually
+        followed by a name with no space before the period).
+        """
+        if len(self._buffer) < self.MIN_SENTENCE_LEN:
+            return
+        # Find the FIRST sentence boundary past MIN_SENTENCE_LEN —
+        # ship the first sentence ASAP for minimum time-to-first-audio.
+        # Boundary: [.!?] followed by whitespace.
+        best = -1
+        i = self.MIN_SENTENCE_LEN - 1
+        while i < len(self._buffer) - 1:
+            ch = self._buffer[i]
+            if ch in ".!?" and self._buffer[i + 1] in " \t\r\n":
+                best = i + 1  # include the punctuation, not the space
+                break          # first boundary wins — ship ASAP
+            i += 1
+        if best < 0:
+            return
+        # Include the trailing space in what we consume so the next
+        # sentence starts cleanly.
+        consume_to = best
+        while consume_to < len(self._buffer) and self._buffer[consume_to] in " \t\r\n":
+            consume_to += 1
+        sentence = self._buffer[:best].strip()
+        self._buffer = self._buffer[consume_to:]
+        if sentence:
+            self._queue.put(("sentence", sentence))
+
+    def _tts_worker(self):
+        """Background thread: pull sentences from the queue, synthesize
+        each one, and append the audio to the speaker buffer."""
+        while True:
+            kind, text = self._queue.get()
+            if kind == "done":
+                self._speaker.mark_complete()
+                return
+            if kind != "sentence" or not text:
+                continue
+            # Strip memory markers before TTS — Winston occasionally
+            # appends [REMEMBER: ...] at the end of a sentence.
+            clean = _VOICE_MARKER_RE.sub("", text).strip()
+            if not clean:
+                continue
+            # Skip planning preambles on the first sentence. The model
+            # sometimes leaks "Got it! Let me think." before the actual
+            # reply.
+            if self._first_sentence:
+                self._first_sentence = False
+                m = _VOICE_PREAMBLE_RE.match(clean)
+                if m:
+                    clean = clean[m.end():].strip()
+                    if not clean:
+                        continue
+            try:
+                audio = _synthesize_with_fallback(clean)
+            except Exception as e:
+                print(f"[voice] sentence TTS failed: {e!r}", flush=True)
+                continue
+            if len(audio) == 0:
+                continue
+            if not self._started_speaking:
+                self._started_speaking = True
+                dt = (time.monotonic() - self._t_start) * 1000
+                print(f"[t] TTS first audio +{dt:.0f}ms "
+                      f"(sentence-stream, {len(audio)/audio_mod.SAMPLE_RATE:.2f}s)",
+                      flush=True)
+                try:
+                    self._on_state_speaking()
+                except Exception:
+                    pass
+            self._speaker.append(audio)
+
+
 # ──────────────── States ────────────────
 STATE_IDLE = "IDLE"
 STATE_LISTENING = "LISTENING"
@@ -145,21 +337,15 @@ STATE_ERROR = "ERROR"
 # no bullet lists, no code blocks (TTS would read them literally),
 # no long answers (3-4 sentences is the sweet spot for back-and-forth).
 VOICE_SYSTEM_PROMPT = """\
-You are Winston, a calm and observant AI butler watching over Max's
-machine. You can see real-time CPU, RAM, GPU, disk, network,
-temperature, and process data — it's provided in each prompt.
+You are Winston — Jarvis-like AI butler. Precise, calm, dry wit.
 
-You speak aloud through a TTS system. Therefore:
-- Keep responses to 1-3 short sentences. You are conversational,
-  not a report writer.
-- Never use markdown, bullet points, asterisks, or code blocks.
-- Read numbers naturally ("forty percent" not "40%") only when
-  it would sound weird otherwise. "Fifty-three Celsius" is fine.
-- Address Max as "Max" sparingly — once per conversation, not
-  every reply.
-- Be direct. If asked "how's my CPU?", answer with the percent and
-  one sentence of context. Don't preamble.
-- If you don't know something, say so briefly.
+This is voice output through TTS. Every extra word is wasted breath.
+ONE sentence. Two ONLY if the question is complex. MAX 25 WORDS.
+No markdown, no bullets, no code blocks. No questions back to the user.
+No closers ("let me know", "how can I help"). Just the answer.
+
+Be direct. "How's my CPU?" → give the percent and one line of context.
+If you don't know, say so in five words.
 """
 
 
@@ -586,6 +772,42 @@ class VoiceEngine:
                 _release()
 
         threading.Thread(target=_synth_and_play, daemon=True).start()
+
+    def speak_streamed(self, on_done: Optional[Callable[[], None]] = None
+                       ) -> SentenceStreamSpeaker:
+        """Start sentence-streaming TTS mode. Returns a
+        SentenceStreamSpeaker that the caller feeds LLM chunks into.
+
+        Usage:
+            streamer = voice.speak_streamed(on_done=callback)
+            # For each LLM chunk:
+            streamer.add_chunk(chunk_text)
+            # When LLM stream is complete:
+            streamer.flush()
+
+        `on_done` fires once after all audio has played — same contract
+        as speak_text's on_done. State transitions:
+            (current) → SPEAKING (when first sentence audio is ready)
+            SPEAKING → IDLE (when speaker drains after mark_complete)
+        """
+        if self.on_winston_text is not None:
+            # We don't have the full text upfront for the streamed path.
+            # on_winston_text is wired to a no-op in presence mode anyway.
+            pass
+
+        def _finished():
+            self._set_state(STATE_IDLE)
+            if on_done is not None:
+                try:
+                    on_done()
+                except Exception:
+                    pass
+
+        return SentenceStreamSpeaker(
+            speaker=self._speaker,
+            on_state_speaking=lambda: self._set_state(STATE_SPEAKING),
+            on_finished=_finished,
+        )
 
     def _on_speaker_finished(self):
         """Fires from the speaker callback when playback drains. Runs on

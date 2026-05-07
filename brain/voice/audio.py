@@ -404,7 +404,11 @@ class SpeakerPlayer:
 
         Trims already-consumed samples off the front so memory usage
         stays bounded across long replies. Cheap (numpy slice + concat;
-        speech utterances are seconds, not minutes)."""
+        speech utterances are seconds, not minutes).
+
+        Rebuilds the amplitude envelope after each append so the orb
+        pulses correctly during sentence-streamed playback. Sub-ms even
+        for a 10s buffer — the reshape+mean is trivial numpy."""
         if audio is None or len(audio) == 0:
             return
         with self._lock:
@@ -415,6 +419,24 @@ class SpeakerPlayer:
                 self._pending,
                 audio.astype(np.float32, copy=False),
             ])
+            # Rebuild the envelope so amplitude() tracks the new buffer
+            # layout. Without this, amplitude() returns 0 during streamed
+            # playback because play_streaming() starts with an empty
+            # envelope and the old append() never updated it.
+            n = len(self._pending)
+            if n > 0:
+                full_bins = n // ENVELOPE_BIN_SAMPLES
+                env = np.zeros(full_bins + 1, dtype=np.float32)
+                if full_bins > 0:
+                    trimmed = self._pending[:full_bins * ENVELOPE_BIN_SAMPLES]
+                    shaped = trimmed.reshape(full_bins, ENVELOPE_BIN_SAMPLES)
+                    env[:full_bins] = np.sqrt(np.mean(shaped * shaped, axis=1))
+                tail = self._pending[full_bins * ENVELOPE_BIN_SAMPLES:]
+                if len(tail) > 0:
+                    env[full_bins] = float(np.sqrt(np.mean(tail * tail)))
+                self._envelope = env
+            else:
+                self._envelope = np.zeros(0, dtype=np.float32)
 
     def mark_complete(self):
         """Signal the streaming session is done — no more append() calls.
