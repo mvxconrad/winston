@@ -33,9 +33,12 @@ import psutil
 from PyQt6.QtCore import (
     Qt, QTimer, QObject, QPoint, pyqtSignal,
 )
-from PyQt6.QtGui import QKeyEvent, QMouseEvent
+from PyQt6.QtGui import (
+    QBrush, QColor, QIcon, QKeyEvent, QMouseEvent, QPainter, QPixmap,
+)
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QPushButton, QVBoxLayout, QWidget,
+    QApplication, QMainWindow, QMenu, QPushButton, QSystemTrayIcon,
+    QVBoxLayout, QWidget,
 )
 
 from .orb import Orb
@@ -210,6 +213,36 @@ class PresenceWindow(QMainWindow):
         # brain.client's worker threads safely.
         self.face.set_bridge(self._bridge)
 
+        # ── System tray icon (watchdog mode) ──
+        # Always created so Winston has a tray presence. In watchdog mode
+        # the window starts hidden and the tray icon is the only visible
+        # sign Winston is running. Double-click the tray icon to toggle
+        # the orb. Right-click for a context menu.
+        self._tray = None
+        self._tray_menu = None   # prevent GC — Qt doesn't own the menu
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray = QSystemTrayIcon(self._make_tray_icon(), self)
+            self._tray.setToolTip("Winston")
+            self._tray_menu = QMenu()
+            self._tray_menu.addAction("Show Orb", self._tray_show_orb)
+            self._tray_menu.addAction("Open Dashboard", self._open_dashboard)
+            self._tray_menu.addSeparator()
+            self._tray_menu.addAction("Quit", QApplication.quit)
+            self._tray.setContextMenu(self._tray_menu)
+            self._tray.activated.connect(self._on_tray_activated)
+
+        # ── Linger timer (watchdog auto-hide) ──
+        # After Winston finishes speaking in watchdog mode, the orb stays
+        # visible for WATCHDOG_LINGER_SEC then hides back to tray.
+        self._linger_timer = QTimer(self)
+        self._linger_timer.setSingleShot(True)
+        self._linger_timer.timeout.connect(self._linger_expired)
+
+        # True when the user manually opened the orb from the tray icon.
+        # Prevents watchdog auto-hide so the orb stays up until the user
+        # explicitly closes it.
+        self._user_summoned = False
+
         self._talk_held = False
         self._reposition_controls()
 
@@ -297,6 +330,86 @@ class PresenceWindow(QMainWindow):
         # Could surface as a brief red tint on the orb — left for later.
         print(f"[presence] error: {msg}", flush=True)
 
+    # ──────────────── Tray icon helpers ────────────────
+    @staticmethod
+    def _make_tray_icon() -> QIcon:
+        """Generate a simple green circle icon for the system tray.
+        No external asset needed — painted at runtime."""
+        size = 64
+        pm = QPixmap(size, size)
+        pm.fill(QColor(0, 0, 0, 0))
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QBrush(QColor(100, 220, 120)))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(4, 4, size - 8, size - 8)
+        p.end()
+        return QIcon(pm)
+
+    def _on_tray_activated(self, reason):
+        """Click or double-click the tray icon to show the orb.
+
+        On Windows, single left-click fires Trigger (the most common
+        interaction); double-click fires DoubleClick. We handle both
+        so the user doesn't have to guess.
+        """
+        print(f"[tray] activated reason={reason}", flush=True)
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.DoubleClick):
+            self._tray_show_orb()
+
+    def _tray_show_orb(self):
+        """Bring the orb window back from the tray.
+
+        Cancels any pending watchdog auto-hide and marks the orb as
+        user-summoned so it stays visible until the user explicitly
+        closes it. Also fires a time-aware greeting ("Good afternoon,
+        Max") so Winston acknowledges being summoned.
+        """
+        print("[tray] _tray_show_orb called", flush=True)
+        self._linger_timer.stop()
+        self._user_summoned = True
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        # Ensure keyboard focus so push-to-talk (space) works immediately.
+        self.setFocus(Qt.FocusReason.OtherFocusReason)
+        # Fire a greeting — Winston should say hello when summoned.
+        # Deferred by 200ms so the window has fully painted and the Qt
+        # event loop can settle after the tray activation signal.
+        QTimer.singleShot(200, self.face.fire_tray_greeting)
+
+    def show_for_watchdog(self):
+        """Watchdog trigger fired — show the orb. Cancel any pending
+        linger-hide so the window stays up for the full speech.
+
+        If the orb is already visible (user summoned it from tray),
+        leave _user_summoned True so the orb won't auto-hide after
+        the triggered speech finishes.
+        """
+        if not self.isVisible():
+            self._user_summoned = False
+        self._linger_timer.stop()
+        self.show()
+        self.raise_()
+
+    def hide_after_linger(self, linger_sec: float):
+        """Start the linger countdown. After linger_sec the orb hides
+        back to the system tray."""
+        ms = int(linger_sec * 1000)
+        self._linger_timer.start(max(ms, 500))
+
+    def _linger_expired(self):
+        """Linger time up — hide back to tray.
+
+        If the user manually opened the orb from the tray icon, we
+        respect that and leave it visible. Auto-hide only applies to
+        watchdog-triggered appearances.
+        """
+        if self._user_summoned:
+            return
+        self.hide()
+
     # ──────────────── Dashboard launch ────────────────
     def _open_dashboard(self):
         """Spawn the dashboard as a separate process so the orb stays
@@ -365,13 +478,22 @@ class PresenceFace:
     callbacks safely onto the UI thread.
     """
 
-    def __init__(self, voice_engine, llm_config, memory, sections):
+    def __init__(self, voice_engine, llm_config, memory, sections,
+                 watchdog: bool = False):
         self.voice = voice_engine
         from brain.commentary_engine import CommentaryEngine
         self.engine = CommentaryEngine(sections, llm_config or {}, memory)
         self.sections = sections
 
+        # Watchdog mode: dormant by default, wake on trigger, sleep after
+        # speech. When False, behaves like the old always-visible presence.
+        self.watchdog = watchdog
+
         self._bridge: Optional[_PresenceBridge] = None
+        # Back-reference to the window — set by run() after construction.
+        # Needed so the face can call window.show_for_watchdog() when a
+        # trigger fires and window.hide_after_linger() when speech ends.
+        self._window: Optional["PresenceWindow"] = None
 
         # 1Hz tick. The Qt timer is created on bridge attach so the face
         # is constructible without a running QApplication (test mode).
@@ -399,25 +521,29 @@ class PresenceFace:
     def start(self):
         """Begin Winston's regular loop.
 
-        Two paths, controlled by `config.STARTUP_GREETING`:
-          - Greeting on  → fire the greeting prompt immediately ("Good
+        Three paths:
+          - Watchdog mode → skip greeting entirely, go straight to
+            trigger loop. Winston is dormant — no reason to announce.
+          - Greeting on   → fire the greeting prompt immediately ("Good
             afternoon, max" or similar). When that finishes speaking,
             the post-speech callback drops us into the regular trigger
             loop. Skips the GUI's longer "retrospective" step — voice
             mode wants short.
-          - Greeting off → straight into trigger loop, no opening line.
+          - Greeting off  → straight into trigger loop, no opening line.
 
         The trigger timer only starts AFTER the greeting plays so we
         don't fire a heartbeat observation on top of "Good afternoon".
         """
         if self.engine.state == "DISABLED":
             return
+        # Watchdog mode: no greeting, straight to dormant monitoring.
+        if self.watchdog:
+            self._begin_regular_loop()
+            return
         if self.engine.config.get("startup_greeting", True):
             self.engine.startup_step = "greeting"
             system, prompt, tier = self.engine.build_greeting()
             if system is None:
-                # Greeting builder bailed (no memory? no LLM?) — skip
-                # straight to regular loop instead of getting stuck.
                 self._begin_regular_loop()
                 return
             self._fire_stream(system, prompt, tier)
@@ -432,6 +558,35 @@ class PresenceFace:
         self.engine.init_triggers()
         if self._trigger_timer is not None and not self._trigger_timer.isActive():
             self._trigger_timer.start(1000)
+
+    # ──────────────── Tray-summoned greeting ────────────────
+    def fire_tray_greeting(self):
+        """User clicked the tray icon — greet with a time-appropriate
+        "Good morning/afternoon/evening, Max".
+
+        Guards:
+          - Engine disabled → skip.
+          - Engine already busy (streaming, cooldown) → skip silently.
+            The user hears the in-flight speech instead.
+          - build_greeting returns None → skip (shouldn't happen).
+        """
+        print(f"[tray] fire_tray_greeting: state={self.engine.state} "
+              f"busy={self.engine.is_busy} cooldown={self.engine._cooldown_active}",
+              flush=True)
+        if self.engine.state == "DISABLED":
+            print("[tray] greeting skipped: engine DISABLED", flush=True)
+            return
+        if self.engine.is_busy:
+            print("[tray] greeting skipped: engine busy", flush=True)
+            return
+        self.engine.startup_step = "greeting"
+        system, prompt, tier = self.engine.build_greeting()
+        if system is None:
+            print("[tray] greeting skipped: build_greeting returned None",
+                  flush=True)
+            return
+        print("[tray] firing greeting stream", flush=True)
+        self._fire_stream(system, prompt, tier)
 
     # ──────────────── User-driven path ────────────────
     def handle_user_speech(self, text: str):
@@ -458,17 +613,34 @@ class PresenceFace:
     def _trigger_tick(self):
         """1Hz: ask the engine if there's anything worth saying. If there
         is, fire a stream. Engine handles cooldown, busy-state, severity
-        preemption — we just relay."""
+        preemption — we just relay.
+
+        In watchdog mode: heartbeats and stale-quiet are suppressed — only
+        real trigger events wake Winston. When a trigger does fire, the
+        orb window is un-hidden before the LLM stream starts so the user
+        sees the orb appear as Winston starts thinking.
+        """
         result = self.engine.evaluate_triggers()
         if result is None:
             return
         kind, payload = result
+        # Watchdog mode: suppress heartbeat and stale-quiet when
+        # WATCHDOG_SUPPRESS_HEARTBEAT is True (default). Only actual
+        # trigger events ("event") get through.
+        if self.watchdog and kind != "event":
+            import config as _cfg
+            if getattr(_cfg, "WATCHDOG_SUPPRESS_HEARTBEAT", True):
+                return
         if kind == "event":
             system, prompt, tier = self.engine.build_triggered(payload)
         else:
             system, prompt, tier = self.engine.build_observation()
         if system is None:
             return
+        # Watchdog: show the orb before the LLM starts streaming so the
+        # user sees Winston wake up as he begins thinking.
+        if self.watchdog and self._window is not None:
+            self._window.show_for_watchdog()
         self._fire_stream(system, prompt, tier)
 
     # ──────────────── Stream wiring ────────────────
@@ -546,11 +718,21 @@ class PresenceFace:
         """Speech finished. Runs on the UI thread (via bridge signal).
         Release the engine cooldown so the next event can fire. If we
         just finished the startup greeting, drop into the regular
-        trigger loop — start the QTimer here, where it's legal."""
+        trigger loop — start the QTimer here, where it's legal.
+
+        In watchdog mode: start the linger countdown so the orb auto-
+        hides back to the system tray after WATCHDOG_LINGER_SEC.
+        """
         was_greeting = self.engine.startup_step == "greeting"
         self.engine.end_cooldown()
         if was_greeting:
+            print("[tray] greeting speech finished", flush=True)
             self._begin_regular_loop()
+        # Watchdog: start the linger-then-hide countdown.
+        if self.watchdog and self._window is not None:
+            import config as _cfg
+            linger = getattr(_cfg, "WATCHDOG_LINGER_SEC", 8)
+            self._window.hide_after_linger(linger)
 
     def on_llm_error(self):
         """LLM stream errored. Engine wants to know; voice goes back to
@@ -563,14 +745,22 @@ class PresenceFace:
         directly so there's exactly one path that releases cooldown
         and restarts the timer.
         """
+        print("[presence] LLM stream errored — check [llm] lines above",
+              flush=True)
         self.engine.on_error()
         self._bridge.speech_done.emit()
 
 
 # ──────────────── Entry point — winston.py calls this ────────────────
-def run(sections, logger, config=None):
+def run(sections, logger, config=None, watchdog=None):
     """Same signature as gui.main.run / cli.display.run, so winston.py
     can dispatch by flag without further plumbing.
+
+    `watchdog` — if True, Winston starts hidden in the system tray and
+    only shows the orb when a trigger fires. After speaking, the orb
+    lingers for WATCHDOG_LINGER_SEC then hides again. No greeting, no
+    heartbeats, no periodic chatter — spikes only. None means "read
+    config.WATCHDOG_MODE"; True/False are authoritative overrides.
 
     Boot sequence:
       1. Prime panels (one update so first frame has real data).
@@ -588,6 +778,11 @@ def run(sections, logger, config=None):
     if config is None:
         import config as default_config
         config = default_config
+
+    # Resolve watchdog flag. None = "nobody told me" → read config.
+    # True/False from the caller (--presence vs default) are authoritative.
+    if watchdog is None:
+        watchdog = getattr(config, "WATCHDOG_MODE", False)
 
     print("WINSTON :: priming sensors...", end=" ", flush=True)
     psutil.cpu_percent(percpu=True)
@@ -658,34 +853,54 @@ def run(sections, logger, config=None):
             memory = None
 
     # Qt app + voice engine.
+    print("[boot] creating QApplication", flush=True)
     app = QApplication.instance() or QApplication(sys.argv)
-    # Belt-and-suspenders against silent exits on Windows. If the orb's
-    # window ever gets temporarily hidden by the OS (focus shift, Tool
-    # window weirdness, taskbar minimize, etc.), Qt's default behavior
-    # is to quit the event loop the moment the last visible window
-    # closes — even if the window object still exists and could be
-    # re-shown. Disabling that behavior keeps Winston alive across any
-    # window-state shenanigans; the user's explicit Ctrl+Q / × button
-    # is the only way to actually exit.
+    print(f"[boot] QApplication ready (platform={app.platformName()})",
+          flush=True)
     app.setQuitOnLastWindowClosed(False)
+    print("[boot] quitOnLastWindowClosed disabled", flush=True)
 
+    print("[boot] constructing VoiceEngine", flush=True)
     from brain.voice.voice_engine import VoiceEngine
     voice = VoiceEngine(
         sections=[p for p, _ in sections],
         llm_config=llm_config,
         memory=memory,
     )
+    print("[boot] VoiceEngine constructed", flush=True)
     voice.warm_up()
+    print("[boot] voice.warm_up() returned (running in bg)", flush=True)
 
+    print("[boot] constructing PresenceFace", flush=True)
     face = PresenceFace(
         voice_engine=voice,
         llm_config=llm_config,
         memory=memory,
         sections=sections,
+        watchdog=watchdog,
     )
+    print("[boot] PresenceFace ok", flush=True)
 
+    print("[boot] constructing PresenceWindow", flush=True)
     window = PresenceWindow(voice_engine=voice, face=face)
-    window.show()
+    face._window = window   # back-reference for show/hide in watchdog
+    print("[boot] PresenceWindow constructed", flush=True)
+
+    if watchdog:
+        # Watchdog: start hidden, tray icon is the only visible presence.
+        # The orb will appear when a trigger fires.
+        if window._tray is not None:
+            window._tray.show()
+        print("[boot] watchdog mode — orb hidden, tray icon active",
+              flush=True)
+    else:
+        window.show()
+        # Show tray icon even in normal presence mode — gives a way to
+        # restore the orb if it gets minimized or lost.
+        if window._tray is not None:
+            window._tray.show()
+        print(f"[boot] window.show() called; isVisible={window.isVisible()}",
+              flush=True)
 
     # Panel ticker — keeps all panels fresh. Triggers + logger read
     # whatever they tick from. CRITICAL: runs on a daemon worker thread,
@@ -748,8 +963,19 @@ def run(sections, logger, config=None):
         threading.Thread(target=log_loop, name="winston-log-loop",
                          daemon=True).start()
 
+    # Lifecycle telemetry — fires when the event loop is about to exit.
+    # If we see this print without the user pressing Ctrl+Q or ×, then
+    # something is calling QApplication.quit() that shouldn't be.
+    def _on_about_to_quit():
+        import traceback
+        print("[boot] aboutToQuit fired — printing stack:", flush=True)
+        traceback.print_stack()
+    app.aboutToQuit.connect(_on_about_to_quit)
+
     # Kick off the brain after a short delay so panels have ticked at
     # least once and the first observation has real data to talk about.
     QTimer.singleShot(800, face.start)
 
-    app.exec()
+    print("[boot] entering Qt event loop", flush=True)
+    rc = app.exec()
+    print(f"[boot] event loop returned rc={rc}", flush=True)

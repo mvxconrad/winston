@@ -117,6 +117,11 @@ def _resolve_host():
         env = env.replace("http://", "").replace("https://", "")
         if ":" in env:
             env = env.split(":")[0]
+        # 0.0.0.0 is a bind-all address (tells Ollama to listen on every
+        # interface), NOT a connectable address. Windows returns WSAEADDRNOTAVAIL
+        # (10049) if you try to connect to it. Map to localhost.
+        if env == "0.0.0.0":
+            return "localhost"
         return env
     gw = _wsl_host_ip()
     if gw:
@@ -226,9 +231,11 @@ def generate_stream(prompt, system=None, model=DEFAULT_MODEL,
                         yield cleaned
                 if obj.get("done"):
                     return
-    except (urllib.error.URLError, OSError, TimeoutError):
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        print(f"[llm] stream error: {e!r} (url={_url})", flush=True)
         return
-    except Exception:
+    except Exception as e:
+        print(f"[llm] stream error (unexpected): {e!r}", flush=True)
         return
 
 
@@ -291,11 +298,15 @@ def _worker_loop():
                     except Exception:
                         # Don't let UI bugs crash the worker
                         pass
-            except Exception:
+            except Exception as e:
+                print(f"[llm] worker stream error: {e!r}", flush=True)
                 had_error = True
 
             full = "".join(chunks).strip()
             if not full:
+                if not had_error:
+                    print("[llm] worker: empty response (no chunks received)",
+                          flush=True)
                 had_error = True
 
             try:

@@ -12,6 +12,7 @@ A personal system monitor with a local-LLM butler. Watches CPU, RAM, GPU, disks,
 ## Quick links
 
 - [Run it](#run)
+- [Deploy (WSL → Windows)](#deploy-wsl--windows)
 - [Panels](#panels)
 - [LLM commentary](#llm-commentary)
 - [Memory](#memory) — what makes Winston more than a fancy `top`
@@ -23,7 +24,7 @@ A personal system monitor with a local-LLM butler. Watches CPU, RAM, GPU, disks,
 
 ## Stack
 
-[Textual](https://github.com/Textualize/textual) + [Rich](https://github.com/Textualize/rich) (TUI), [PyQt6](https://pypi.org/project/PyQt6/) + [pyqtgraph](https://pyqtgraph.org/) (GUI), [psutil](https://github.com/giampaolo/psutil), [pynvml](https://pypi.org/project/pynvml/) (optional), [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) (optional, for WSL temps), [Ollama](https://ollama.com) (optional, for commentary).
+[Textual](https://github.com/Textualize/textual) + [Rich](https://github.com/Textualize/rich) (TUI), [PyQt6](https://pypi.org/project/PyQt6/) + [pyqtgraph](https://pyqtgraph.org/) (GUI), [psutil](https://github.com/giampaolo/psutil), [pynvml](https://pypi.org/project/pynvml/) (optional), [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) (optional, for WSL temps), [Ollama](https://ollama.com) (optional, for commentary), [ElevenLabs](https://elevenlabs.io) + [Piper](https://github.com/rhasspy/piper) (TTS), [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (STT).
 
 ## GUI (desktop)
 
@@ -42,19 +43,53 @@ A personal system monitor with a local-LLM butler. Watches CPU, RAM, GPU, disks,
 ![Winston reacting to a load spike](docs/screenshot-active.png)
 *Triggered — `yes > /dev/null` on four cores. The `single_core_pegged` trigger fired.*
 
+## Voice (presence orb)
+
+`python winston.py --presence` — a floating translucent orb that sits on your screen. Hold **Space** to push-to-talk. Winston listens via faster-whisper (STT), thinks via Ollama, and responds aloud via ElevenLabs Flash v2.5 (primary) or Piper (local fallback). The orb pulses with audio amplitude and shifts color with state (green idle, bright green listening, amber thinking, bright green speaking).
+
+## Watchdog (default)
+
+`python winston.py` — the default mode. Winston starts hidden in the system tray with no visible window. The brain runs in the background monitoring the same triggers as every other mode. When a hardware spike fires (CPU pegged, thermal alert, memory pressure, etc.), the orb pops up, Winston speaks the observation, then hides back to the tray after a configurable linger period (`WATCHDOG_LINGER_SEC`, default 8s). Click the tray icon to summon Winston — he greets you with a time-aware hello and stays visible until you close him. Push-to-talk works the same as presence mode.
+
+Controlled by `WATCHDOG_MODE`, `WATCHDOG_LINGER_SEC`, and `WATCHDOG_SUPPRESS_HEARTBEAT` in `config.py`.
+
 ## Run
 
 ```bash
 pip install textual psutil pynvml PyQt6 pyqtgraph
 ollama pull qwen2.5:3b-instruct           # routine commentary
 ollama pull qwen2.5:7b-instruct           # loaded on demand for /-asked questions
-python winston.py                          # TUI (default)
-python winston.py --gui                    # PyQt6 desktop app
+python winston.py                          # watchdog (default) — dormant in tray, wakes on spikes
+python winston.py --presence               # always-visible orb + voice
+python winston.py --gui                    # PyQt6 desktop dashboard
+python winston.py --cli                    # Textual TUI
 ```
 
-`Q` quit · `R` reset graphs · `/` focus the ASK input. GUI also has `F11` fullscreen and `Ctrl+↑/↓/←/→` snap.
+`Q` quit · `R` reset graphs · `/` focus the ASK input. GUI also has `F11` fullscreen and `Ctrl+↑/↓/←/→` snap. Presence/watchdog: **Space** push-to-talk · **J** open dashboard · **Ctrl+Q** quit.
 
 All tunables live in `config.py` (refresh rates, LLM behavior, trigger thresholds). `winston.py` is just imports + the section list.
+
+## Deploy (WSL → Windows)
+
+If you develop in WSL but want Winston running natively on Windows (for proper system tray, native audio, accurate process monitoring), a single command syncs everything:
+
+```bash
+cd ~/projects/sysmonitor
+chmod +x deploy.sh
+./deploy.sh
+```
+
+What it does (re-runnable, idempotent):
+
+1. **Syncs source** to `C:\Users\<you>\Winston` via rsync (only changed files)
+2. **Creates a Python venv** on the Windows side (if missing)
+3. **Installs pip dependencies** (PyQt6, faster-whisper, elevenlabs, etc.)
+4. **Downloads Piper voice model** (~50 MB, one-time)
+5. **Copies `.env`** (ElevenLabs API key) if present
+6. **Generates launchers** — `winston.vbs` (no console, daily driver), `winston.bat` (debug), `winston-debug.bat` (presence mode)
+7. **Creates a Windows Startup shortcut** so Winston launches on login
+
+Requirements: WSL2 with rsync, Windows Python 3.10+ on PATH, Ollama running on Windows. Override the auto-detected username with `WIN_USER=yourname ./deploy.sh` if needed.
 
 ## Panels
 
@@ -313,6 +348,20 @@ cli/                    # TUI frontend — only renders engine state
 
 gui/                    # desktop frontend — only renders engine state
   main.py               # PyQt6 + pyqtgraph; QMainWindow + view widgets
+  presence.py           # voice orb face: PresenceWindow + PresenceFace +
+                        # watchdog lifecycle (tray icon, linger timer,
+                        # trigger-driven show/hide)
+  orb.py                # reusable QWidget — glowing circle, state-colored,
+                        # amplitude-reactive. Decoupled via callbacks.
+
+brain/voice/            # voice pipeline
+  voice_engine.py       # STT + TTS orchestrator, push-to-talk state machine
+  tts_elevenlabs.py     # ElevenLabs Flash v2.5 (primary TTS)
+  tts_piper.py          # Piper local fallback TTS
+  stt.py                # faster-whisper STT (base.en, CPU)
+  speaker.py            # PortAudio playback with drain callback
+
+deploy.sh               # one-command WSL → Windows deploy (see above)
 
 logs/                   # gitignored
   raw/observations.csv  # 1 row/sec time-series CSV
@@ -331,10 +380,11 @@ logs/                   # gitignored
 
 See [`TODO.md`](TODO.md). Short version of what's next:
 
+- **Streaming TTS** — pre-buffer ~1.5s of LLM output then begin TTS while the model is still generating. Cuts perceived latency roughly in half on longer replies.
+- **Orb visual polish** — state-aware text color, amplitude-scaled glow layer, final sizing pass.
 - **5.5b** — fully tier-aware preemption (notable preempts routine mid-stream, not just alerts).
 - **5.6** — tools the LLM can call (`read_log`, `get_process_details`, `query_baseline`).
 - **5.7** — refactor: split `display.py` and `panels/temps.py` along natural seams.
-- **5.8** — cleanups from v0.8 review (memory schema dedup, throttle commentary repaints to FPS clock, more usage-pattern tools).
 - **9** — process graph view (`G` opens an Obsidian-style force-directed graph; nodes = processes, size = memory, color = CPU).
 
 ## Why "Winston"

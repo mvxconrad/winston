@@ -149,6 +149,26 @@ TTS_MODEL_ID = "eleven_flash_v2_5"      # ~75ms first chunk, near-flagship quali
 STARTUP_GREETING = True
 
 
+# ─────────────────────────── Watchdog mode ───────────────────────────
+# Winston's default mode. He sits dormant in the system tray, invisible,
+# polling hardware at low frequency. When a trigger fires (CPU spike,
+# thermal warning, memory pressure, etc.) he wakes up: the orb appears,
+# he speaks the observation aloud, then fades back to the tray. No
+# dashboard, no heartbeats, no periodic chatter — just spike reactions.
+#
+# Set to False to get the old always-visible-orb behavior (--presence).
+WATCHDOG_MODE = True
+
+# How long (seconds) the orb stays visible after Winston finishes
+# speaking before it hides back to the system tray. Gives the user
+# time to glance over and register what was said.
+WATCHDOG_LINGER_SEC = 8
+
+# Suppress heartbeat/stale-quiet in watchdog mode. When True, Winston
+# only speaks when an actual trigger fires — no "all good" every 5 min.
+WATCHDOG_SUPPRESS_HEARTBEAT = True
+
+
 # ─────────────────────────── Commentary display ───────────────────────────
 # How fast the typewriter reveals tokens to the UI. The LLM generates much
 # faster (~80 tok/s); buffering and slowing makes the output feel deliberate.

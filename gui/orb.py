@@ -131,6 +131,15 @@ class Orb(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
+        # Near-invisible background (alpha=1 out of 255, ~0.4% opacity).
+        # Visually undetectable, but on Windows with WA_TranslucentBackground
+        # the DWM uses per-pixel alpha for hit-testing: fully transparent
+        # pixels are click-through. Without this fill, the corners of the
+        # frameless window are dead zones — the × button is unreachable and
+        # dragging only works when you start on the opaque circle. Alpha=1
+        # makes the full rectangle "occupied" for mouse events.
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 1))
+
         center, edge, ring = STATE_COLORS.get(state, STATE_COLORS["IDLE"])
 
         # 1) Outer halo — biggest, faintest layer. Expands aggressively
@@ -183,24 +192,24 @@ class Orb(QWidget):
         painter.drawEllipse(QPointF(cx, cy), orb_r, orb_r)
 
         # 5) WINSTON name centered inside the orb. Letter-spaced for a
-        # hi-tech feel; size scales with orb radius so it doesn't look
-        # off if the window is resized. Drawn near-black for contrast
-        # against the bright orb body — this is the same trick the
-        # original orb used and looked sharp.
+        # hi-tech feel. Font size is pinned to base_r (NOT orb_r) so
+        # the text stays rock-steady while the orb body pulses with
+        # amplitude. Earlier version tied font size to orb_r which made
+        # the text jitter on every frame — looked terrible.
         font = QFont()
         font.setFamilies(["JetBrains Mono", "Consolas", "monospace"])
-        # Size scales with orb so the name is legible at any window size
-        # without overflowing on small windows.
-        font.setPointSizeF(max(8, orb_r * 0.20))
+        font.setPointSizeF(max(7, base_r * 0.15))
         font.setBold(True)
-        font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 145)
+        font.setLetterSpacing(QFont.SpacingType.PercentageSpacing, 160)
         painter.setFont(font)
-        # Slightly translucent black so the gradient reads through —
-        # makes the text feel embedded in the orb's surface.
-        text_color = QColor("#000000")
-        text_color.setAlphaF(0.78)
+        # Slightly translucent so the gradient reads through —
+        # text feels embedded in the orb's surface, not painted on top.
+        text_color = QColor(center)
+        text_color = text_color.darker(280)
+        text_color.setAlphaF(0.65)
         painter.setPen(text_color)
-        rect = QRectF(cx - orb_r, cy - orb_r, orb_r * 2, orb_r * 2)
-        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "WINSTON")
+        # Rect pinned to base_r so text position doesn't shift with amp.
+        text_rect = QRectF(cx - base_r, cy - base_r, base_r * 2, base_r * 2)
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, "WINSTON")
 
         painter.end()
