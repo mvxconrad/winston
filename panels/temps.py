@@ -303,8 +303,8 @@ class TempsPanel:
             self.help_message = None
             return
 
-        # Only try Windows backends if we look like we're on WSL
-        if _is_wsl():
+        # Try Windows backends — works both in WSL and native Windows.
+        if _is_wsl() or platform.system() == "Windows":
             # LHM data comes from the shared background poller (panels.lhm).
             # Reading from the cache is essentially free — no blocking HTTP
             # call from the UI thread.
@@ -325,13 +325,13 @@ class TempsPanel:
                 self.help_message = None
                 return
 
-            # WSL with no working backend — give helpful instructions
+            # Windows with no working backend — give helpful instructions
             self.readings = []
             self.backend = None
             self.help_message = "wsl"
             return
 
-        # Non-WSL Linux/macOS without sensors
+        # Non-Windows Linux/macOS without sensors
         self.readings = []
         self.backend = None
         self.help_message = "generic"

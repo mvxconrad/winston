@@ -205,11 +205,22 @@ The personality block at the top of each prompt is built from memory. Apps rende
 
 ## Architecture
 
-### Master frame loop (30 FPS)
+### SensorHub — single source of truth
 
-The whole dashboard refreshes on a single 30 Hz clock (`FRAME_HZ` in `config.py`). One `set_interval` in `display.py:WinstonApp.on_mount` drives `_frame_tick`, which checks each panel's per-panel rate and only fires `panel.update()` when due. Widget refreshes are batched per frame so Textual's compositor sees one coherent pass instead of 14 uncoordinated ones.
+All hardware data flows through `sensor_hub.py:SensorHub`. One daemon thread polls every panel; both the orb and the dashboard read the same panel objects. No duplicate polling, no second process.
 
-Why it matters: visual consistency (no panel jitter from mismatched cadences) and input responsiveness (asyncio loop has time to read keystrokes between frames).
+Two tiers of panels:
+
+| Tier | Panels | When polled |
+| --- | --- | --- |
+| **Essential** | CPU, RAM, System, Temps, GPU, Network, Processes | Always — needed for triggers |
+| **Dashboard-only** | CpuGraphPanel, DiskPanel | Only while the dashboard is open |
+
+When you open the dashboard from the orb (J key, double-click, or voice command "open the dashboard"), it creates the window **in-process** — same panels, same hub, no subprocess. `hub.activate_all()` starts polling the extras. Close the dashboard and `hub.deactivate_extras()` drops back to essentials. The dashboard never calls `panel.update()` — it only refreshes view widgets from the already-updated data.
+
+### Master frame loop (10 FPS)
+
+The dashboard refreshes on a single 10 Hz clock (`FRAME_HZ` in `config.py`). Each tick checks per-panel rate gating and only refreshes views whose data has been updated. Satellite mode (dashboard opened from the orb) runs at 5 fps to save CPU for games.
 
 ### The 5 ms rule: heavy work goes on a thread
 
@@ -313,7 +324,9 @@ ollama pull qwen2.5:7b-instruct
 ## Project layout
 
 ```
-winston.py              # entry point — picks frontend via --gui flag
+winston.py              # entry point — picks frontend, creates SensorHub
+sensor_hub.py           # single source of truth — daemon thread polls panels,
+                        # two-tier activation (essential vs dashboard-only)
 config.py               # all tunables (FRAME_HZ, GPU_BUSY_*, panel hz, LLM, triggers)
 theme.py                # color decisions: heat_pct() / heat_temp() helpers
 logger.py               # 1 Hz CSV writer

@@ -120,14 +120,22 @@ class ProcessesPanel:
     def title(self):
         return "PROCESSES (host+wsl)" if self.win_procs else "PROCESSES"
 
+    # Noise processes to hide — these either show inverted idle time
+    # (System Idle Process) or are Windows kernel bookkeeping that
+    # clutters the top-N list without being actionable.
+    _HIDDEN = frozenset({"System Idle Process", "Idle"})
+
     def update(self):
         procs = []
         for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_info']):
             try:
                 info = p.info
+                name = info['name'] or '?'
+                if name in self._HIDDEN:
+                    continue
                 cpu = info['cpu_percent'] or 0.0
                 mem = info['memory_info'].rss if info['memory_info'] else 0
-                procs.append((cpu, mem, info['name'] or '?', info['pid']))
+                procs.append((cpu, mem, name, info['pid']))
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
         procs.sort(key=lambda p: -p[0])

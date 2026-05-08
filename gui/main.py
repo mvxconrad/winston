@@ -31,8 +31,8 @@ import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSignal
 from PyQt6.QtGui import QFont, QShortcut, QKeySequence
 from PyQt6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QProgressBar, QVBoxLayout, QWidget,
+    QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QMainWindow, QProgressBar, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from theme import heat_pct, heat_temp
@@ -107,7 +107,17 @@ class PanelFrame(QFrame):
 
 class HeatBar(QProgressBar):
     """Progress bar whose fill color is driven by the value — mirrors
-    the TUI's heat-mapped bars. Single source of truth: theme.heat_pct."""
+    the TUI's heat-mapped bars. Single source of truth: theme.heat_pct.
+
+    Supports smooth interpolation: call setTarget() to set a new value
+    and lerp_tick() periodically to animate toward it. Or call setValue()
+    for an immediate jump (backwards-compatible).
+
+    Performance: lerp_tick only touches the widget when the displayed
+    integer value actually changes, so idle bars cost ~zero.
+    """
+
+    _LERP_SPEED = 0.35  # fraction of gap closed per lerp tick
 
     def __init__(self, parent=None, max_val=100, height=10):
         super().__init__(parent)
@@ -116,17 +126,40 @@ class HeatBar(QProgressBar):
         self.setFixedHeight(height)
         self._max_val = max_val
         self._last_color = None
+        self._last_int = -1  # dirty-check: skip setValue if unchanged
+        self._target = 0.0
+        self._current = 0.0
         self._apply(0)
 
+    def setTarget(self, value):
+        """Set the target value — call lerp_tick() to animate."""
+        self._target = max(0, min(self._max_val, float(value)))
+
+    def lerp_tick(self):
+        """Advance current toward target. Only touches the widget when
+        the displayed integer changes — idle bars are free."""
+        diff = self._target - self._current
+        if abs(diff) < 0.5:
+            self._current = self._target
+        else:
+            self._current += diff * self._LERP_SPEED
+        v = int(round(self._current))
+        if v == self._last_int:
+            return  # nothing visible changed — skip repaint
+        self._last_int = v
+        super().setValue(max(0, min(int(self._max_val), v)))
+        self._apply(self._current / self._max_val * 100 if self._max_val else 0)
+
     def setValue(self, value):
-        v = max(0, min(self._max_val, int(value)))
-        super().setValue(v)
-        self._apply(v / self._max_val * 100 if self._max_val else 0)
+        """Immediate jump — no interpolation."""
+        self._target = max(0, min(self._max_val, float(value)))
+        self._current = self._target
+        v = int(round(self._current))
+        self._last_int = v
+        super().setValue(max(0, min(int(self._max_val), v)))
+        self._apply(self._current / self._max_val * 100 if self._max_val else 0)
 
     def _apply(self, pct):
-        # Dirty-check: setStyleSheet triggers a reflow + repaint of the
-        # entire widget, so skip when the heat color hasn't changed.
-        # Saves a bunch of work on the 16-core CORES grid + temp bars.
         color = heat_pct(pct)
         if color == self._last_color:
             return
@@ -164,7 +197,9 @@ class CpuGraphView(QWidget):
         layout.addWidget(self._readout)
 
         # Plot config — solid black bg, minimal axes, 0–100 fixed Y.
-        pg.setConfigOptions(antialias=True)
+        # antialias=False saves significant CPU — pyqtgraph AA is software-
+        # rendered and fires every repaint across all plots.
+        pg.setConfigOptions(antialias=False)
         self._plot = pg.PlotWidget()
         self._plot.setBackground(BG)
         self._plot.setYRange(0, 100, padding=0)
@@ -238,60 +273,83 @@ class CpuGraphView(QWidget):
 
 
 class CoresView(QWidget):
-    """Per-core grid of horizontal bars."""
+    """CPU-core heatmap — compact colored grid instead of per-core bars.
+
+    Each core is a small cell whose background color reflects utilization
+    via theme.heat_pct(). The core number sits inside the cell. Layout
+    is a 2-row grid (top half / bottom half of cores) so it stays compact
+    and readable even with 16+ cores.
+
+    Values are interpolated between panel updates so the heatmap animates
+    smoothly at the frame rate instead of jumping every 250ms.
+    """
+
+    _LERP_SPEED = 0.35  # fraction of gap closed per lerp tick
 
     def __init__(self, panel, parent=None):
         super().__init__(parent)
         self.panel = panel
-        self._grid = QVBoxLayout(self)
-        self._grid.setContentsMargins(0, 0, 0, 0)
-        self._grid.setSpacing(1)
-        self._rows = []  # list of (label, bar, value_label) per core
-        self._last_pcts = []
-        self._last_colors = []
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(0, 2, 0, 2)
+        self._grid.setSpacing(2)
+        self._cells = []        # list of QLabel per core
+        self._targets = []      # target utilization per core (from panel)
+        self._displayed = []    # currently displayed (interpolated) value
+        self._last_colors = []  # dirty-check: skip stylesheet if unchanged
+        self._last_ints = []    # dirty-check: skip setText if unchanged
 
     def refresh(self):
         values = self.panel.values
-        # Build rows lazily on first refresh once we know core count.
-        if not self._rows:
-            for i in range(len(values)):
-                row = QHBoxLayout()
-                row.setSpacing(6)
-                idx_label = QLabel(f"{i:>2}")
-                idx_label.setFont(_mono(9))
-                idx_label.setStyleSheet(f"color: {DIM};")
-                idx_label.setFixedWidth(20)
-                bar = HeatBar(height=8)
-                val_label = QLabel("0%")
-                val_label.setFont(_mono(9))
-                val_label.setStyleSheet(f"color: {DIM};")
-                val_label.setFixedWidth(36)
-                val_label.setAlignment(Qt.AlignmentFlag.AlignRight)
-                row.addWidget(idx_label)
-                row.addWidget(bar, stretch=1)
-                row.addWidget(val_label)
-                self._grid.addLayout(row)
-                self._rows.append((idx_label, bar, val_label))
-            # Stretch absorbs any leftover vertical space so the bars
-            # stay packed at the top of the panel rather than spreading
-            # out.
-            self._grid.addStretch(1)
-            self._last_pcts = [-1] * len(values)
-            self._last_colors = [None] * len(values)
+        # Build cells lazily on first refresh once we know core count.
+        if not self._cells:
+            n = len(values)
+            cols = max(1, (n + 1) // 2)  # 2 rows
+            for i in range(n):
+                cell = QLabel(f"{i}")
+                cell.setFont(_mono(8))
+                cell.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                cell.setMinimumSize(28, 24)
+                row_idx = 0 if i < cols else 1
+                col_idx = i if i < cols else i - cols
+                self._grid.addWidget(cell, row_idx, col_idx)
+                self._cells.append(cell)
+            self._targets = list(values)
+            self._displayed = list(values)
+            self._last_colors = [None] * n
+            self._last_ints = [-1] * n
 
-        for i, ((idx_label, bar, val_label), v) in enumerate(zip(self._rows, values)):
-            pct_int = int(round(v))
-            # Dirty-check per-row: only touch the widgets if the integer
-            # percent actually changed. Cuts setText / setStyleSheet calls
-            # on idle cores down to ~zero.
-            if pct_int != self._last_pcts[i]:
-                bar.setValue(v)
-                val_label.setText(f"{pct_int:>3d}%")
-                self._last_pcts[i] = pct_int
-            color = heat_pct(v)
+        # Update targets — interpolation happens in _lerp_tick.
+        self._targets = list(values)
+        self._lerp_tick()
+
+    def _lerp_tick(self):
+        """Advance displayed values toward targets. Only touches widgets
+        when the displayed integer or heat color actually changes."""
+        speed = self._LERP_SPEED
+        for i, cell in enumerate(self._cells):
+            if i >= len(self._targets):
+                break
+            target = self._targets[i]
+            cur = self._displayed[i]
+            if abs(target - cur) < 0.5:
+                cur = target
+            else:
+                cur += (target - cur) * speed
+            self._displayed[i] = cur
+            pct = max(0, min(100, cur))
+            pct_int = int(round(pct))
+            # Skip all widget work if nothing visible changed
+            if pct_int == self._last_ints[i]:
+                continue
+            self._last_ints[i] = pct_int
+            color = heat_pct(pct)
             if color != self._last_colors[i]:
-                val_label.setStyleSheet(f"color: {color};")
                 self._last_colors[i] = color
+                cell.setStyleSheet(
+                    f"background: {color}; color: #000; "
+                    f"border-radius: 3px; font-weight: bold;"
+                )
+            cell.setText(f"{pct_int}")
 
 
 class MemoryView(QWidget):
@@ -306,11 +364,17 @@ class MemoryView(QWidget):
         layout.setContentsMargins(0, 8, 0, 8)
         layout.setSpacing(8)
 
-        self._label = QLabel("0% 0.0GB of 0.0GB")
-        self._label.setFont(_mono(11))
-        self._label.setStyleSheet(f"color: {MEDIUM};")
-        self._label.setTextFormat(Qt.TextFormat.RichText)
-        layout.addWidget(self._label)
+        self._pct_label = QLabel("0%")
+        self._pct_label.setFont(_mono(13))
+        self._pct_label.setStyleSheet(f"color: {MEDIUM};")
+        self._pct_label.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(self._pct_label)
+
+        self._size_label = QLabel("0.0GB of 0.0GB")
+        self._size_label.setFont(_mono(9))
+        self._size_label.setStyleSheet(f"color: {DIM};")
+        self._size_label.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(self._size_label)
 
         self._bar = HeatBar()
         # Taller bar so MEMORY has a strong visual anchor in its box.
@@ -332,7 +396,7 @@ class MemoryView(QWidget):
 
     def refresh(self):
         pct = getattr(self.panel, "value", 0) or 0
-        self._bar.setValue(pct)
+        self._bar.setTarget(pct)
         used = getattr(self.panel, "used", 0) or 0
         total = getattr(self.panel, "total", 0) or 0
         avail = getattr(self.panel, "available", None)
@@ -340,9 +404,11 @@ class MemoryView(QWidget):
             avail = max(0, total - used)
         gb = lambda b: b / (1024 ** 3)
         color = heat_pct(pct)
-        self._label.setText(
+        self._pct_label.setText(
             f"<span style='color:{color}; font-weight:bold;'>{int(round(pct))}%</span>"
-            f"  <span style='color:{MEDIUM};'>{gb(used):.1f}GB of {gb(total):.1f}GB</span>"
+        )
+        self._size_label.setText(
+            f"<span style='color:{MEDIUM};'>{gb(used):.1f}GB / {gb(total):.1f}GB</span>"
         )
         self._avail.setText(
             f"<span style='color:{DIM};'>free  </span>"
@@ -409,7 +475,7 @@ class GpuView(QWidget):
         self._name.setText(g.get("name", "?"))
 
         util = g.get("util") or 0
-        self._util.setValue(util)
+        self._util.setTarget(util)
         power = g.get("power")
         power_limit = g.get("power_limit")
         power_str = (f"{power:.0f}W of {power_limit:.0f}W"
@@ -422,7 +488,7 @@ class GpuView(QWidget):
         mem_u = g.get("mem_used") or 0
         mem_t = g.get("mem_total") or 1
         vram_pct = (mem_u / mem_t * 100)
-        self._vram.setValue(vram_pct)
+        self._vram.setTarget(vram_pct)
         gb = lambda b: b / (1024 ** 3)
         self._vram_text.setText(
             f"VRAM {int(round(vram_pct))}%   {gb(mem_u):.1f}GB of {gb(mem_t):.1f}GB"
@@ -482,10 +548,14 @@ class ProcessesView(QWidget):
             return lbl
 
         header_row.addWidget(_hdr("PID", 50, Qt.AlignmentFlag.AlignRight))
-        header_row.addWidget(_hdr("NAME", 200))
+        name_hdr = QLabel("NAME")
+        name_hdr.setFont(_mono(9))
+        name_hdr.setStyleSheet(f"color: {DIM};")
+        name_hdr.setMinimumWidth(100)
+        name_hdr.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        header_row.addWidget(name_hdr)
         header_row.addWidget(_hdr("CPU%", 60, Qt.AlignmentFlag.AlignRight))
         header_row.addWidget(_hdr("MEM", 80, Qt.AlignmentFlag.AlignRight))
-        header_row.addStretch(1)
         layout.addLayout(header_row)
 
         # Body: one QHBoxLayout per data row, all sharing the same column
@@ -511,7 +581,8 @@ class ProcessesView(QWidget):
 
             name = QLabel("")
             name.setFont(_mono(9))
-            name.setFixedWidth(200)
+            name.setMinimumWidth(100)
+            name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
             name.setTextFormat(Qt.TextFormat.RichText)
 
             cpu = QLabel("")
@@ -530,7 +601,6 @@ class ProcessesView(QWidget):
             row.addWidget(name)
             row.addWidget(cpu)
             row.addWidget(mem)
-            row.addStretch(1)
             self._rows_box.addLayout(row)
             self._row_widgets.append((pid, name, cpu, mem))
 
@@ -699,7 +769,7 @@ class DiskView(QWidget):
                 color = heat_pct(p)
                 lbl.setTextFormat(Qt.TextFormat.RichText)
                 lbl.setText(f"<span style='color:{BRIGHT};'>{label}</span>")
-                bar.setValue(p)
+                bar.setTarget(p)
                 pct.setTextFormat(Qt.TextFormat.RichText)
                 pct.setText(f"<span style='color:{color}; font-weight:bold;'>{int(round(p)):>3d}%</span>")
                 size.setText(f"{fmt_bytes(used)} of {fmt_bytes(total)}")
@@ -756,7 +826,7 @@ class TempsView(QWidget):
                 color = heat_temp(current)
                 lbl.setTextFormat(Qt.TextFormat.RichText)
                 lbl.setText(f"<span style='color:{color}; font-weight:bold;'>{label}</span>")
-                bar.setValue(current)  # 0–110 is fine for typical sensors
+                bar.setTarget(current)  # 0–110 is fine for typical sensors
                 tmp.setTextFormat(Qt.TextFormat.RichText)
                 tmp.setText(f"<span style='color:{color}; font-weight:bold;'>{int(round(current))}°C</span>")
                 lbl.show(); bar.show(); tmp.show()
@@ -1375,11 +1445,22 @@ class AskInput(QLineEdit):
 class WinstonGui(QMainWindow):
     """Master window. Owns the frame loop and the per-panel due-time
     bookkeeping — same pattern as display.py:WinstonApp but using QTimer
-    instead of Textual's set_interval."""
+    instead of Textual's set_interval.
 
-    def __init__(self, sections, logger, llm_config=None, memory=None):
+    satellite mode (satellite=True):
+      Panels are NOT updated here — an external owner (the orb's panel
+      loop thread) handles that. The frame tick only refreshes View
+      widgets from the already-updated panel data. No LLM commentary,
+      no logger ticks, no BRAIN panel. Closing the window doesn't quit
+      the application. Used when the dashboard is opened from the orb.
+    """
+
+    def __init__(self, sections, logger, llm_config=None, memory=None,
+                 satellite=False, hub=None):
         super().__init__()
-        self.setWindowTitle("Winston")
+        self._satellite = satellite
+        self._hub = hub
+        self.setWindowTitle("Winston" + (" — Dashboard" if satellite else ""))
         self.resize(1500, 950)
         self.setStyleSheet(f"QMainWindow, QWidget {{ background: {BG}; color: {BRIGHT}; }}")
 
@@ -1405,21 +1486,17 @@ class WinstonGui(QMainWindow):
         root.addWidget(self._status)
 
         # ── Row sizing strategy ──
-        # Data panels use fixed-ish heights so the layout doesn't grow
-        # with the window. COMMENTARY is the one that absorbs all extra
-        # vertical space (it can hold many chat lines). Per row:
-        #   CPU LOAD   ~ 200 px (graph needs room)
-        #   row1       ~ 220 px (16 cores need vertical room)
-        #   row2       ~ 170 px (5 temp rows + GPU needs medium room)
-        #   row3       ~ 220 px (top-N processes table)
-        # Plus status / commentary / ask / footer which manage their own.
+        # Minimum heights keep panels readable at smaller sizes.
+        # Stretch factors let rows expand proportionally at fullscreen
+        # so the dashboard fills the screen instead of leaving dead space.
+        # The CPU graph and process table benefit most from extra height.
 
         # CPU LOAD — full-width
         self._cpu_graph = CpuGraphView(by_cls["CpuGraphPanel"])
         cpu_frame = PanelFrame("CPU LOAD")
         cpu_frame.body().addWidget(self._cpu_graph)
-        cpu_frame.setFixedHeight(200)
-        root.addWidget(cpu_frame)
+        cpu_frame.setMinimumHeight(150)
+        root.addWidget(cpu_frame, stretch=3)
 
         # ── Row 1: CORES (2fr) | MEMORY (1fr) | SYSTEM (1fr) ──
         row1 = QHBoxLayout()
@@ -1442,11 +1519,8 @@ class WinstonGui(QMainWindow):
 
         row1_container = QWidget()
         row1_container.setLayout(row1)
-        # Cores dictate the height: 16 bars at 11px + chrome ≈ 215.
-        # SYSTEM and MEMORY use line-height tricks below to spread their
-        # content over the same budget so the boxes don't show black gaps.
-        row1_container.setFixedHeight(220)
-        root.addWidget(row1_container)
+        row1_container.setMinimumHeight(110)
+        root.addWidget(row1_container, stretch=1)
 
         # ── Row 2: DISK (1fr) | TEMPS (2fr) | GPU (2fr) ──
         row2 = QHBoxLayout()
@@ -1469,8 +1543,8 @@ class WinstonGui(QMainWindow):
 
         row2_container = QWidget()
         row2_container.setLayout(row2)
-        row2_container.setFixedHeight(170)
-        root.addWidget(row2_container)
+        row2_container.setMinimumHeight(140)
+        root.addWidget(row2_container, stretch=2)
 
         # ── Row 3: NETWORK (1fr) | PROCESSES (2fr) ──
         row3 = QHBoxLayout()
@@ -1488,73 +1562,81 @@ class WinstonGui(QMainWindow):
 
         row3_container = QWidget()
         row3_container.setLayout(row3)
-        # Sized to fit ~14 process rows + header + frame chrome. Bumped
-        # from 220 so PROCESSES isn't stuck displaying half-empty.
-        row3_container.setFixedHeight(240)
-        root.addWidget(row3_container)
+        row3_container.setMinimumHeight(180)
+        root.addWidget(row3_container, stretch=3)
 
-        # ── COMMENTARY (LLM streaming) on top of BRAIN — both full width ──
-        # COMMENTARY absorbs the leftover vertical space (chat log can grow);
-        # BRAIN sits below at a fixed-ish height for diagnostic glance. Both
-        # span full width so neither feels cramped.
-        self._commentary = CommentaryView(
-            llm_config=self.llm_config,
-            memory=self.memory,
-            sections=self.sections,
-        )
-        commentary_frame = PanelFrame("COMMENTARY")
-        commentary_frame.body().addWidget(self._commentary)
-        commentary_frame.setMinimumHeight(140)
-        root.addWidget(commentary_frame, stretch=1)
-
-        # BRAIN — Winston's internal state. Optional via SHOW_BRAIN_PANEL.
-        # Sized to fit STATE/HOST/KNOWS(3 apps)/LAST without wasted space.
+        # ── COMMENTARY + BRAIN + ASK — only in standalone mode ──
+        # In satellite mode (opened from the orb), the orb owns the LLM.
+        # The dashboard is panels-only — more vertical space for data.
+        self._commentary = None
         self._brain = None
         self._brain_view = None
         self._brain_due_at = None
-        if self.llm_config.get("enabled") and self.llm_config.get("show_brain_panel", True):
-            from panels.brain import BrainPanel
-            from brain.client import status as client_status
-            self._brain = BrainPanel(
-                memory=self.memory,
-                get_state=lambda: self._commentary.engine.state,
-                get_last_event=lambda: self._commentary.engine.last_event,
-                client_status=client_status,
-            )
-            self._brain_view = BrainView(self._brain)
-            brain_frame = PanelFrame("BRAIN", accent=True)
-            brain_frame.body().addWidget(self._brain_view)
-            # Tall enough for 8 lines (state, host, knows-header, 3 apps,
-            # last, vault path, vault pages) without crowding out COMMENTARY.
-            brain_frame.setFixedHeight(170)
-            root.addWidget(brain_frame)
+        self._ask = None
 
-        # ── ASK input ──
-        # Press `/` from anywhere to focus (matches the TUI binding).
-        self._ask = AskInput()
-        self._ask.submitted.connect(self._commentary.ask_user)
-        ask_frame = PanelFrame("ASK", accent=True)
-        ask_frame.body().addWidget(self._ask)
-        root.addWidget(ask_frame)
+        if not self._satellite:
+            self._commentary = CommentaryView(
+                llm_config=self.llm_config,
+                memory=self.memory,
+                sections=self.sections,
+            )
+            commentary_frame = PanelFrame("COMMENTARY")
+            commentary_frame.body().addWidget(self._commentary)
+            commentary_frame.setMinimumHeight(140)
+            root.addWidget(commentary_frame, stretch=1)
+
+            if self.llm_config.get("enabled") and self.llm_config.get("show_brain_panel", True):
+                from panels.brain import BrainPanel
+                from brain.client import status as client_status
+                self._brain = BrainPanel(
+                    memory=self.memory,
+                    get_state=lambda: self._commentary.engine.state,
+                    get_last_event=lambda: self._commentary.engine.last_event,
+                    client_status=client_status,
+                )
+                self._brain_view = BrainView(self._brain)
+                brain_frame = PanelFrame("BRAIN", accent=True)
+                brain_frame.body().addWidget(self._brain_view)
+                brain_frame.setFixedHeight(170)
+                root.addWidget(brain_frame)
+
+            self._ask = AskInput()
+            self._ask.submitted.connect(self._commentary.ask_user)
+            ask_frame = PanelFrame("ASK", accent=True)
+            ask_frame.body().addWidget(self._ask)
+            root.addWidget(ask_frame)
 
         # `/` focus is handled in keyPressEvent so the QLineEdit can still
         # receive `/` as literal input when it already has focus.
 
         # Footer
-        footer = QLabel(
-            f"<span style='color:{BRIGHT}; font-weight:bold;'>Q</span>"
-            f"<span style='color:{DIM};'>/</span>"
-            f"<span style='color:{BRIGHT}; font-weight:bold;'>Ctrl+Q</span>"
-            f" <span style='color:{DIM};'>quit</span> · "
-            f"<span style='color:{BRIGHT}; font-weight:bold;'>R</span>"
-            f" <span style='color:{DIM};'>reset</span> · "
-            f"<span style='color:{BRIGHT}; font-weight:bold;'>/</span>"
-            f" <span style='color:{DIM};'>ask</span> · "
-            f"<span style='color:{BRIGHT}; font-weight:bold;'>F11</span>"
-            f" <span style='color:{DIM};'>fullscreen</span> · "
-            f"<span style='color:{BRIGHT}; font-weight:bold;'>Ctrl+↑/↓/←/→</span>"
-            f" <span style='color:{DIM};'>snap</span>"
-        )
+        if self._satellite:
+            footer_html = (
+                f"<span style='color:{BRIGHT}; font-weight:bold;'>Q</span>"
+                f" <span style='color:{DIM};'>close</span> · "
+                f"<span style='color:{BRIGHT}; font-weight:bold;'>R</span>"
+                f" <span style='color:{DIM};'>reset</span> · "
+                f"<span style='color:{BRIGHT}; font-weight:bold;'>F11</span>"
+                f" <span style='color:{DIM};'>fullscreen</span> · "
+                f"<span style='color:{BRIGHT}; font-weight:bold;'>Ctrl+↑/↓/←/→</span>"
+                f" <span style='color:{DIM};'>snap</span>"
+            )
+        else:
+            footer_html = (
+                f"<span style='color:{BRIGHT}; font-weight:bold;'>Q</span>"
+                f"<span style='color:{DIM};'>/</span>"
+                f"<span style='color:{BRIGHT}; font-weight:bold;'>Ctrl+Q</span>"
+                f" <span style='color:{DIM};'>quit</span> · "
+                f"<span style='color:{BRIGHT}; font-weight:bold;'>R</span>"
+                f" <span style='color:{DIM};'>reset</span> · "
+                f"<span style='color:{BRIGHT}; font-weight:bold;'>/</span>"
+                f" <span style='color:{DIM};'>ask</span> · "
+                f"<span style='color:{BRIGHT}; font-weight:bold;'>F11</span>"
+                f" <span style='color:{DIM};'>fullscreen</span> · "
+                f"<span style='color:{BRIGHT}; font-weight:bold;'>Ctrl+↑/↓/←/→</span>"
+                f" <span style='color:{DIM};'>snap</span>"
+            )
+        footer = QLabel(footer_html)
         footer.setFont(_mono(9))
         footer.setStyleSheet(f"padding: 2px 8px;")
         root.addWidget(footer)
@@ -1568,6 +1650,14 @@ class WinstonGui(QMainWindow):
             iv = 1.0 / hz
             self._panel_intervals[id(panel)] = iv
             self._panel_due_at[id(panel)] = now + iv
+
+        # HeatBar instances for per-frame interpolation. Collected
+        # lazily because DiskView/TempsView create bars on first refresh.
+        self._all_heat_bars = None  # populated on first frame tick
+        self._bar_rescan_at = 0.0
+        self._heat_bar_sources = (self._memory, self._gpu, self._disk, self._temps)
+        # The CoresView heatmap also needs per-frame lerp ticks.
+        self._cores_view = self._cores
 
         # Map panel id -> the View widget that needs refreshing
         self._panel_view = {
@@ -1596,10 +1686,13 @@ class WinstonGui(QMainWindow):
         self._busy_skip_counter = 0
         self._gpu_panel = by_cls.get("GpuPanel")
 
-        # Master frame loop. QTimer is millisecond-resolution — good
-        # enough at 30fps (33ms intervals).
+        # Master frame loop. Satellite mode (opened from orb) runs at
+        # half rate — it's just displaying data from the hub, the orb
+        # is doing the real work. 5fps saves CPU for games.
         import config as _cfg
-        frame_hz = float(getattr(_cfg, "FRAME_HZ", 30.0))
+        frame_hz = float(getattr(_cfg, "FRAME_HZ", 10.0))
+        if self._satellite:
+            frame_hz = min(frame_hz, 5.0)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._frame_tick)
         self._timer.start(int(1000 / frame_hz))
@@ -1608,7 +1701,9 @@ class WinstonGui(QMainWindow):
         # Fire greeting + retrospective once Qt has finished laying out the
         # window. QTimer.singleShot(0, ...) defers to the next event-loop
         # iteration so the user sees the dashboard before the ritual starts.
-        if self.llm_config.get("enabled") and self.llm_config.get("startup_greeting", True):
+        if (self._commentary is not None
+                and self.llm_config.get("enabled")
+                and self.llm_config.get("startup_greeting", True)):
             QTimer.singleShot(300, self._commentary.start_startup_ritual)
 
     def _update_gpu_busy_state(self, now):
@@ -1639,16 +1734,19 @@ class WinstonGui(QMainWindow):
         return self._gpu_busy
 
     def _frame_tick(self):
-        """Master tick. For each panel that's due, run update() on its
-        data class then refresh its View widget. Status bar + logger are
-        gated separately."""
+        """Master tick. Refresh view widgets from panel data.
+
+        In satellite mode (opened from the orb), panel.update() is
+        NEVER called here — the SensorHub's daemon thread handles all
+        polling. We only refresh the View widgets and run lerp ticks.
+
+        In standalone mode (--gui), we still call panel.update() here
+        for backwards compatibility with the CLI TUI path.
+        """
         import time
         now = time.monotonic()
 
         # GPU-busy throttle: skip ~5 of every 6 frames when a game is hot.
-        # Critical 1Hz items (status, logger) still fire because their own
-        # due-time gating is below this skip — but they only ever land on
-        # frames we DON'T skip, which is fine at this rate.
         if self._update_gpu_busy_state(now):
             self._busy_skip_counter += 1
             if self._busy_skip_counter % 6 != 0:
@@ -1661,20 +1759,35 @@ class WinstonGui(QMainWindow):
             if now < self._panel_due_at.get(id(panel), 0):
                 continue
             self._panel_due_at[id(panel)] = now + self._panel_intervals[id(panel)]
-            try:
-                panel.update()
-            except Exception:
-                continue
+            if self._hub is None:
+                # No hub — standalone mode without SensorHub, poll here.
+                try:
+                    panel.update()
+                except Exception:
+                    continue
             try:
                 self._panel_view[id(panel)].refresh()
             except Exception:
                 pass
 
+        # Per-frame interpolation — runs every frame (not gated by panel
+        # rate) so bars and the heatmap animate smoothly between updates.
+        # Re-collect bars every 2s in case DiskView/TempsView grew new ones.
+        if self._all_heat_bars is None or self._bar_rescan_at <= now:
+            self._all_heat_bars = []
+            for view in self._heat_bar_sources:
+                self._all_heat_bars.extend(view.findChildren(HeatBar))
+            self._bar_rescan_at = now + 2.0
+        for bar in self._all_heat_bars:
+            bar.lerp_tick()
+        if hasattr(self._cores_view, '_lerp_tick'):
+            self._cores_view._lerp_tick()
+
         if now >= self._status_due_at:
             self._status_due_at = now + 1.0
             self._status.refresh()
 
-        if now >= self._log_due_at:
+        if self._hub is None and now >= self._log_due_at:
             self._log_due_at = now + 1.0
             try:
                 self.logger.log(self.sections)
@@ -1711,7 +1824,7 @@ class WinstonGui(QMainWindow):
             super().keyPressEvent(event)
             return
 
-        if event.text() == "/":
+        if event.text() == "/" and self._ask is not None:
             self._ask.setFocus()
             return
         if key == Qt.Key.Key_F11:
@@ -1762,17 +1875,33 @@ class WinstonGui(QMainWindow):
         super().keyPressEvent(event)
 
     def closeEvent(self, event):
-        try:
-            self.logger.close()
-        except Exception:
-            pass
+        if self._satellite:
+            # Satellite mode: just close the window. Don't stop the
+            # logger (the hub owns it), don't quit the app (the orb
+            # keeps running). Tell the hub to deactivate dashboard-only
+            # panels so we stop polling CpuGraphPanel/DiskPanel.
+            if hasattr(self, '_hub') and self._hub is not None:
+                self._hub.deactivate_extras()
+            self._timer.stop()
+            super().closeEvent(event)
+            return
+        if self.logger is not None:
+            try:
+                self.logger.close()
+            except Exception:
+                pass
+        if self._hub is not None:
+            self._hub.stop()
         super().closeEvent(event)
 
 
 # ──────────────── Entry point ────────────────
-def run(sections, logger, config=None):
+def run(sections, logger, config=None, hub=None):
     """Same signature as display.run() so winston.py can pick either
     frontend without further plumbing.
+
+    `hub` — SensorHub instance. When provided, the hub handles all
+    panel polling and logging. The GUI only refreshes view widgets.
 
     Primes panels synchronously (so the first frame has real data),
     then hands off to the Qt event loop.
@@ -1780,8 +1909,6 @@ def run(sections, logger, config=None):
     if config is None:
         import config as default_config
         config = default_config
-
-    print("WINSTON :: priming sensors...", end=" ", flush=True)
 
     psutil.cpu_percent(percpu=True)
     psutil.cpu_percent()
@@ -1796,8 +1923,6 @@ def run(sections, logger, config=None):
             panel.update()
         except Exception:
             pass
-
-    print("ready.")
 
     # Mirror display.run()'s llm_config + memory bootstrap so the GUI
     # path has the same parameters available even though we don't wire
@@ -1839,7 +1964,15 @@ def run(sections, logger, config=None):
             memory = None
 
     app = QApplication.instance() or QApplication([])
-    win = WinstonGui(sections, logger, llm_config=llm_config, memory=memory)
+
+    # Start the SensorHub if provided. In standalone --gui mode, the hub
+    # polls all panels (activate_all) since the dashboard needs everything.
+    if hub is not None:
+        hub.activate_all()
+        hub.start()
+
+    win = WinstonGui(sections, logger, llm_config=llm_config, memory=memory,
+                     hub=hub)
     # Open maximized so the dashboard fills the screen by default. F11
     # toggles true fullscreen (no title bar) once running.
     win.showMaximized()

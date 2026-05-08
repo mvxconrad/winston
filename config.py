@@ -33,8 +33,9 @@ this is the file.
 # panel updates land in the same paint pass — no visual jitter from panels
 # on different cadences. Per-panel hz settings below still control how often
 # each panel re-fetches its DATA; the frame rate just sets when the screen
-# is repainted. 30 is comfortable; 60 is silky if your CPU has the headroom.
-FRAME_HZ       = 30.0
+# is repainted. 10 is plenty for a system monitor — data only changes every
+# 250ms-1s. Higher rates burn CPU on redundant repaints.
+FRAME_HZ       = 10.0
 
 # GPU-busy throttle: when a game is running the GPU spikes and the terminal
 # emulator gets starved of redraws by Windows, making Winston feel laggy.
@@ -46,15 +47,15 @@ GPU_BUSY_PCT       = 50      # threshold (%)
 GPU_BUSY_HOLD_SEC  = 3.0     # how long above threshold before throttling
 GPU_CALM_HOLD_SEC  = 5.0     # how long below threshold before resuming
 
-CPU_GRAPH_HZ   = 4.0
-CPU_CORES_HZ   = 4.0
-RAM_HZ         = 2.0
+CPU_GRAPH_HZ   = 2.0   # was 4 — data barely changes in 250ms
+CPU_CORES_HZ   = 2.0   # was 4
+RAM_HZ         = 1.0   # was 2 — RAM doesn't swing fast
 SYSTEM_HZ      = 0.5
 DISK_HZ        = 0.1
-TEMPS_HZ       = 1.0
-GPU_HZ         = 2.0
-NETWORK_HZ     = 2.0
-PROCESSES_HZ   = 1.0
+TEMPS_HZ       = 0.5   # was 1 — temps move slowly
+GPU_HZ         = 1.0   # was 2
+NETWORK_HZ     = 1.0   # was 2
+PROCESSES_HZ   = 0.5   # was 1 — process_iter is the most expensive call
 PROCESSES_LIMIT = 14   # rows shown in the PROCESSES panel
 
 LOGGER_HZ      = 1.0  # fixed-rate CSV writes (clean time-series for analysis)

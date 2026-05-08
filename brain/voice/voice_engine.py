@@ -312,10 +312,6 @@ class SentenceStreamSpeaker:
                 continue
             if not self._started_speaking:
                 self._started_speaking = True
-                dt = (time.monotonic() - self._t_start) * 1000
-                print(f"[t] TTS first audio +{dt:.0f}ms "
-                      f"(sentence-stream, {len(audio)/audio_mod.SAMPLE_RATE:.2f}s)",
-                      flush=True)
                 try:
                     self._on_state_speaking()
                 except Exception:
@@ -649,8 +645,6 @@ class VoiceEngine:
             t_stt_start = time.monotonic()
             user_text = stt.transcribe(audio)
             stt_ms = (time.monotonic() - t_stt_start) * 1000
-            print(f"[t] STT            +{stt_ms:.0f}ms (\"{(user_text or '')[:60]}\")",
-                  flush=True)
             if not user_text:
                 # No speech detected (or just silence). Bail quietly.
                 self._set_state(STATE_IDLE)
@@ -761,9 +755,6 @@ class VoiceEngine:
                 _release()
                 return
             dt = (time.monotonic() - t_speak_start) * 1000
-            print(f"[t] TTS first audio +{dt:.0f}ms "
-                  f"(non-streaming, {len(audio_out)/audio_mod.SAMPLE_RATE:.2f}s clip)",
-                  flush=True)
             try:
                 self._set_state(STATE_SPEAKING)
                 self._speaker.play(audio_out, on_finished=_finished)

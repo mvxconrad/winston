@@ -77,6 +77,7 @@ from panels.network   import NetworkPanel
 from panels.processes import ProcessesPanel
 
 from logger import Logger
+from sensor_hub import SensorHub
 
 
 # Section list: (panel_instance, refresh_hz). Order here drives the
@@ -94,6 +95,11 @@ sections = [
 ]
 
 logger = Logger()
+
+# SensorHub — single source of truth for all hardware data. Both the
+# orb and the dashboard read from these panel objects. The hub's daemon
+# thread is the only thing that ever calls panel.update().
+hub = SensorHub(sections, logger=logger, config=config)
 
 
 # Mode dispatch. Order is intentional: explicit face flags win over
@@ -123,12 +129,12 @@ else:
     from gui.presence import run
     _watchdog = True
 
-# gui.presence.run accepts the extra kwarg; gui.main.run and cli.display.run
-# don't, so we only pass it when dispatching to presence.
-if "--gui" in sys.argv or "--cli" in sys.argv:
+# GUI and presence faces receive the hub. The hub starts polling;
+# each face just reads panel data and refreshes its widgets.
+# CLI (Textual TUI) manages its own polling for now.
+if "--cli" in sys.argv:
     run(sections, logger, config=config)
+elif "--gui" in sys.argv:
+    run(sections, logger, config=config, hub=hub)
 else:
-    # Presence path (default or --presence). Pass watchdog explicitly so
-    # run() doesn't fall back to config.WATCHDOG_MODE — the user's flag
-    # should be authoritative.
-    run(sections, logger, config=config, watchdog=_watchdog)
+    run(sections, logger, config=config, hub=hub, watchdog=_watchdog)

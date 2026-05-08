@@ -354,7 +354,6 @@ class PresenceWindow(QMainWindow):
         interaction); double-click fires DoubleClick. We handle both
         so the user doesn't have to guess.
         """
-        print(f"[tray] activated reason={reason}", flush=True)
         if reason in (QSystemTrayIcon.ActivationReason.Trigger,
                       QSystemTrayIcon.ActivationReason.DoubleClick):
             self._tray_show_orb()
@@ -367,7 +366,6 @@ class PresenceWindow(QMainWindow):
         closes it. Also fires a time-aware greeting ("Good afternoon,
         Max") so Winston acknowledges being summoned.
         """
-        print("[tray] _tray_show_orb called", flush=True)
         self._linger_timer.stop()
         self._user_summoned = True
         self.show()
@@ -413,21 +411,44 @@ class PresenceWindow(QMainWindow):
 
     # ──────────────── Dashboard launch ────────────────
     def _open_dashboard(self):
-        """Spawn the dashboard as a separate process so the orb stays
-        present while the dashboard runs alongside it.
+        """Open the dashboard in-process. Same panels, same hub, no
+        duplicate polling. The dashboard is panels-only (satellite mode)
+        — the orb keeps running the brain and voice.
 
-        Two processes share memory.json (last-write-wins on save). For
-        v1 this is fine — the dashboard's commentary loop and the orb's
-        commentary loop tick independently. Future: unify into one
-        process with a face-switch toggle.
+        Closing the dashboard window just hides it and tells the hub
+        to deactivate the dashboard-only panels (CpuGraphPanel, DiskPanel).
+
+        Always defers to the UI thread via QTimer.singleShot(0) because
+        this can be called from a voice-command worker thread — creating
+        QWidgets off the main thread crashes Qt with "Cannot create
+        children for a parent that is in a different thread".
         """
-        import subprocess
-        import sys
+        QTimer.singleShot(0, self._open_dashboard_ui)
+
+    def _open_dashboard_ui(self):
+        """Actual dashboard creation — guaranteed to run on the UI thread."""
+        # Already open — just raise it.
+        if (hasattr(self, '_dashboard') and self._dashboard is not None
+                and self._dashboard.isVisible()):
+            self._dashboard.raise_()
+            self._dashboard.activateWindow()
+            return
+
         try:
-            entry = str(Path(__file__).resolve().parent.parent / "winston.py")
-            subprocess.Popen([sys.executable, entry, "--gui"])
+            from gui.main import WinstonGui
+            hub = getattr(self, '_hub', None)
+            # Build the dashboard using the same sections the hub polls.
+            sections = hub.sections if hub else []
+            dash = WinstonGui(sections, logger=None, satellite=True, hub=hub)
+            dash.show()
+            self._dashboard = dash
+
+            # Tell the hub to start polling dashboard-only panels
+            # (CpuGraphPanel, DiskPanel) now that someone's looking.
+            if hub is not None:
+                hub.activate_all()
         except Exception as e:
-            print(f"[presence] failed to launch dashboard: {e!r}", flush=True)
+            print(f"[presence] failed to open dashboard: {e!r}", flush=True)
 
     # ──────────────── Keys ────────────────
     def keyPressEvent(self, event: QKeyEvent):
@@ -575,22 +596,14 @@ class PresenceFace:
             The user hears the in-flight speech instead.
           - build_greeting returns None → skip (shouldn't happen).
         """
-        print(f"[tray] fire_tray_greeting: state={self.engine.state} "
-              f"busy={self.engine.is_busy} cooldown={self.engine._cooldown_active}",
-              flush=True)
         if self.engine.state == "DISABLED":
-            print("[tray] greeting skipped: engine DISABLED", flush=True)
             return
         if self.engine.is_busy:
-            print("[tray] greeting skipped: engine busy", flush=True)
             return
         self.engine.startup_step = "greeting"
         system, prompt, tier = self.engine.build_greeting()
         if system is None:
-            print("[tray] greeting skipped: build_greeting returned None",
-                  flush=True)
             return
-        print("[tray] firing greeting stream", flush=True)
         self._fire_stream(system, prompt, tier)
 
     # ──────────────── Voice commands ────────────────
@@ -698,8 +711,6 @@ class PresenceFace:
         self._t_fire = time.monotonic()
         self._t_first_chunk: Optional[float] = None
         self._t_llm_done: Optional[float] = None
-        print(f"[t] LLM fired (model={model}, keep_alive={keep_alive}s, tier={tier})",
-              flush=True)
         # Sentence-streaming TTS: start a SentenceStreamSpeaker that
         # will receive LLM chunks in on_llm_chunk, fire TTS per
         # sentence, and play audio through the speaker as sentences
@@ -721,10 +732,6 @@ class PresenceFace:
     def on_llm_chunk(self, chunk: str):
         if self._t_first_chunk is None:
             self._t_first_chunk = time.monotonic()
-            dt = (self._t_first_chunk - self._t_fire) * 1000
-            # First chunk latency — this is where cold-load taxes show
-            # up. Warm 7b: ~200-400ms. Cold-load 7b: 3000-10000ms.
-            print(f"[t] LLM first chunk +{dt:.0f}ms", flush=True)
         self.engine.on_chunk(chunk)
         # Feed chunk to sentence streamer — it will fire TTS as soon
         # as a complete sentence accumulates.
@@ -744,9 +751,6 @@ class PresenceFace:
         will emit speech_done when all audio has played.
         """
         self._t_llm_done = time.monotonic()
-        if self._t_fire:
-            dt = (self._t_llm_done - self._t_fire) * 1000
-            print(f"[t] LLM done       +{dt:.0f}ms (full reply)", flush=True)
         self.engine.on_done(full_text)
         # Snap the typewriter to the end so the next tick finalizes.
         self.engine.typed_chars = len(self.engine.streaming_buffer)
@@ -778,7 +782,6 @@ class PresenceFace:
         was_greeting = self.engine.startup_step == "greeting"
         self.engine.end_cooldown()
         if was_greeting:
-            print("[tray] greeting speech finished", flush=True)
             self._begin_regular_loop()
         # Watchdog: start the linger-then-hide countdown.
         if self.watchdog and self._window is not None:
@@ -797,8 +800,6 @@ class PresenceFace:
         directly so there's exactly one path that releases cooldown
         and restarts the timer.
         """
-        print("[presence] LLM stream errored — check [llm] lines above",
-              flush=True)
         # Cancel any in-flight sentence streamer so it doesn't try to
         # TTS partial text or leave the speaker in a weird state.
         if self._sentence_streamer is not None:
@@ -809,9 +810,13 @@ class PresenceFace:
 
 
 # ──────────────── Entry point — winston.py calls this ────────────────
-def run(sections, logger, config=None, watchdog=None):
+def run(sections, logger, config=None, hub=None, watchdog=None):
     """Same signature as gui.main.run / cli.display.run, so winston.py
     can dispatch by flag without further plumbing.
+
+    `hub` — SensorHub instance that owns all panel polling. If provided,
+    the orb doesn't start its own panel loop — it reads from the hub's
+    shared panel objects.
 
     `watchdog` — if True, Winston starts hidden in the system tray and
     only shows the orb when a trigger fires. After speaking, the orb
@@ -841,7 +846,6 @@ def run(sections, logger, config=None, watchdog=None):
     if watchdog is None:
         watchdog = getattr(config, "WATCHDOG_MODE", False)
 
-    print("WINSTON :: priming sensors...", end=" ", flush=True)
     psutil.cpu_percent(percpu=True)
     psutil.cpu_percent()
     for p in psutil.process_iter():
@@ -854,7 +858,6 @@ def run(sections, logger, config=None, watchdog=None):
             panel.update()
         except Exception:
             pass
-    print("ready.")
 
     # llm_config — same shape as gui.main.run() but with voice-mode-only
     # overrides for keep_alive.
@@ -910,25 +913,17 @@ def run(sections, logger, config=None, watchdog=None):
             memory = None
 
     # Qt app + voice engine.
-    print("[boot] creating QApplication", flush=True)
     app = QApplication.instance() or QApplication(sys.argv)
-    print(f"[boot] QApplication ready (platform={app.platformName()})",
-          flush=True)
     app.setQuitOnLastWindowClosed(False)
-    print("[boot] quitOnLastWindowClosed disabled", flush=True)
 
-    print("[boot] constructing VoiceEngine", flush=True)
     from brain.voice.voice_engine import VoiceEngine
     voice = VoiceEngine(
         sections=[p for p, _ in sections],
         llm_config=llm_config,
         memory=memory,
     )
-    print("[boot] VoiceEngine constructed", flush=True)
     voice.warm_up()
-    print("[boot] voice.warm_up() returned (running in bg)", flush=True)
 
-    print("[boot] constructing PresenceFace", flush=True)
     face = PresenceFace(
         voice_engine=voice,
         llm_config=llm_config,
@@ -936,103 +931,52 @@ def run(sections, logger, config=None, watchdog=None):
         sections=sections,
         watchdog=watchdog,
     )
-    print("[boot] PresenceFace ok", flush=True)
 
-    print("[boot] constructing PresenceWindow", flush=True)
     window = PresenceWindow(voice_engine=voice, face=face)
     face._window = window   # back-reference for show/hide in watchdog
-    print("[boot] PresenceWindow constructed", flush=True)
 
     if watchdog:
         # Watchdog: start hidden, tray icon is the only visible presence.
         # The orb will appear when a trigger fires.
         if window._tray is not None:
             window._tray.show()
-        print("[boot] watchdog mode — orb hidden, tray icon active",
-              flush=True)
     else:
         window.show()
         # Show tray icon even in normal presence mode — gives a way to
         # restore the orb if it gets minimized or lost.
         if window._tray is not None:
             window._tray.show()
-        print(f"[boot] window.show() called; isVisible={window.isVisible()}",
-              flush=True)
 
-    # Panel ticker — keeps all panels fresh. Triggers + logger read
-    # whatever they tick from. CRITICAL: runs on a daemon worker thread,
-    # NOT a QTimer on the UI thread. ProcessesPanel.update() iterates
-    # psutil.process_iter() which can take 50-200ms — long enough to
-    # block the event loop and cause the orb to skip frames + caption
-    # to stutter. Qt is fine with us mutating panel state from a worker
-    # because the brain reads it via thread-safe attribute reads (no Qt
-    # widgets are touched here).
-    import threading
+    # SensorHub — single source of truth for all hardware data. The hub
+    # owns the polling thread and the logger. Both the orb and (later)
+    # the in-process dashboard read from the same panel objects.
+    if hub is not None:
+        hub.start()
+    else:
+        # Fallback for direct calls without a hub (e.g. tests).
+        from sensor_hub import SensorHub
+        hub = SensorHub(sections, logger=logger, config=config)
+        hub.start()
 
-    panel_stop = threading.Event()
-    last_due = {id(p): 0.0 for p, _ in sections}
-    intervals = {id(p): 1.0 / hz for p, hz in sections}
+    # Store hub reference on the window so _open_dashboard can pass it
+    # to the in-process dashboard.
+    window._hub = hub
 
-    def panel_loop():
-        while not panel_stop.is_set():
-            now = time.monotonic()
-            for panel, _hz in sections:
-                pid = id(panel)
-                if now < last_due[pid]:
-                    continue
-                last_due[pid] = now + intervals[pid]
-                try:
-                    panel.update()
-                except Exception:
-                    pass
-                # Tiny GIL yield BETWEEN each panel update. Without
-                # this, a single "iterate every panel" pass holds the
-                # GIL for ~50-150ms (ProcessesPanel.update iterates
-                # psutil.process_iter — Python-side work). PortAudio's
-                # callback thread runs Python code (the speaker
-                # callback) which also needs the GIL; if it can't grab
-                # it for >128ms (one CHUNK_SAMPLES at 16kHz) the
-                # ALSA buffer underruns and Winston stutters.
-                # 1ms sleep is enough to let the audio callback run.
-                time.sleep(0.001)
-            # Sleep just under the fastest panel's period so we don't
-            # over-poll. 200ms is fine — even the snappiest panel
-            # (CPU at 4Hz) only needs an update every 250ms.
-            panel_stop.wait(0.2)
-
-    threading.Thread(target=panel_loop, name="winston-panel-loop",
-                     daemon=True).start()
-
-    # Logger ticks at LOGGER_HZ on its own worker thread — same reason
-    # as the panel loop above (logger.write iterates panels and writes
-    # CSV; non-trivial I/O that doesn't belong on the UI thread).
-    if logger is not None:
-        log_interval_sec = 1.0 / max(0.1, getattr(config, "LOGGER_HZ", 1.0))
-
-        def log_loop():
-            while not panel_stop.is_set():
-                try:
-                    logger.write(sections)
-                except Exception:
-                    pass
-                panel_stop.wait(log_interval_sec)
-
-        threading.Thread(target=log_loop, name="winston-log-loop",
-                         daemon=True).start()
-
-    # Lifecycle telemetry — fires when the event loop is about to exit.
-    # If we see this print without the user pressing Ctrl+Q or ×, then
-    # something is calling QApplication.quit() that shouldn't be.
-    def _on_about_to_quit():
-        import traceback
-        print("[boot] aboutToQuit fired — printing stack:", flush=True)
-        traceback.print_stack()
-    app.aboutToQuit.connect(_on_about_to_quit)
+    # Stop the hub BEFORE Qt tears down its event dispatcher. Without
+    # this, the hub's daemon thread keeps calling panel.update() while
+    # Qt is destroying widgets, producing floods of "QBasicTimer::start:
+    # current thread's event dispatcher has already been destroyed".
+    def _cleanup():
+        hub.stop()
+        if logger is not None:
+            try:
+                logger.close()
+            except Exception:
+                pass
+    app.aboutToQuit.connect(_cleanup)
 
     # Kick off the brain after a short delay so panels have ticked at
     # least once and the first observation has real data to talk about.
     QTimer.singleShot(800, face.start)
 
-    print("[boot] entering Qt event loop", flush=True)
-    rc = app.exec()
-    print(f"[boot] event loop returned rc={rc}", flush=True)
+    app.exec()

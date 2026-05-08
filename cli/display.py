@@ -1021,7 +1021,7 @@ class WinstonApp(App):
         self.logger.close()
 
 
-def run(sections, logger, config=None):
+def run(sections, logger, config=None, hub=None):
     """Prime panels with one update each (so the screen renders with data
     immediately) THEN start the Textual app. Slow panels like DiskPanel
     finish their initial scan during this priming phase, before the user
