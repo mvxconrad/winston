@@ -36,6 +36,7 @@ this is the file.
 # is repainted. 10 is plenty for a system monitor — data only changes every
 # 250ms-1s. Higher rates burn CPU on redundant repaints.
 FRAME_HZ       = 10.0
+WINSTON_FPS    = 60          # Winston HUD circle animation rate (all 3 UIs)
 
 # GPU-busy throttle: when a game is running the GPU spikes and the terminal
 # emulator gets starved of redraws by Windows, making Winston feel laggy.

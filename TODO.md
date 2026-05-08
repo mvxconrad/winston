@@ -304,6 +304,140 @@ end up in the same input field. If we later want a button it just
 calls the same code path.
 
 
+## Stage 5.95: Command Dashboard + RECON Mode
+
+Multi-tab dashboard with a tactical command center and global
+intelligence tool. Branch: `recon-dashboard`.
+
+### Phase 1: Command Tab ✅ (mostly — cleanup pending)
+The dashboard gets a tab bar: HARDWARE (existing panels) | COMMAND | RECON.
+Command tab layout: green-on-black military palette.
+
+- [x] Tab bar widget — switch between HARDWARE / COMMAND / RECON
+- [x] Command tab left column: triggers panel + hardware vitals + alerts
+- [x] Command tab center: Winston neural core orb (particles, rings,
+      breathing animation, voice waveform, state display)
+- [x] Command tab right: mini globe + permissions toggles + loaded tools
+- [x] Green palette (`#22c55e` primary, `#0ea5e9` accent, red for alerts)
+- [x] WinstonState — single source of truth for state + amplitude,
+      shared across floating orb, hardware tab, and command tab
+- [x] WinstonCore — QPainter HUD circle with gravity-bounce ticks,
+      concentric arcs, orbital particles, breathing core glow
+- [x] Push-to-talk spacebar works in all contexts via app-level eventFilter
+- [x] Hardware tab: two-column layout, Winston spans full right column
+- [x] Floating orb: QWidget + WA_TranslucentBackground, radial gradient
+      disc, warm teal (70,210,150), friendlier brighter core
+- [x] Performance: pre-built color palettes, PreciseTimer, 24 ticks,
+      18 particles, fewer arc segments
+- [x] Orb guards against showing during dashboard triggers
+
+#### Cleanup before RECON
+- [ ] Wire live trigger data into command tab left column
+- [ ] Connect vitals bars to SensorHub polling
+- [ ] Hook up alert log to real trigger events
+- [ ] Finalize globe/map placeholder or replace with something useful
+
+#### Known issues
+- [ ] Grey rectangle around floating orb on native Windows — persists
+      despite WA_TranslucentBackground, WA_NoSystemBackground,
+      CompositionMode_Clear, DwmExtendFrameIntoClientArea, transparent
+      stylesheet. Likely driver-level compositing or needs layered
+      window via raw win32 API. Not a dealbreaker.
+- [ ] × / minimize hover buttons need fine-tuning on position
+
+### Phase 2: RECON Tab — Globe View
+Voice: "Winston, recon mode" → opens RECON tab with spinning globe.
+
+- [ ] Embed CesiumJS in QWebEngineView for 3D globe
+- [ ] Globe auto-spins on idle (slow rotation)
+- [ ] World stats overlay on default globe view (population heatmap,
+      major cities glowing, global metrics sidebar)
+- [ ] Free tile stack: CartoDB Dark Matter + Cesium World Terrain
+      (both free, no API key needed for Dark Matter)
+- [ ] Nominatim geocoding for voice commands (free, 1 req/sec)
+- [ ] Python → JS bridge via page().runJavaScript() for camera control
+
+### Phase 3: RECON — Fly-To Intel Brief
+Voice: "Take me to Tokyo" / "Show me Detroit" → fly-to + intel panels.
+
+- [ ] CesiumJS camera.flyTo() animation to target coordinates
+- [ ] Intel panels populate on arrival: demographics, political,
+      economy, infrastructure, environment
+- [ ] Free data sources: World Bank API, CIA Factbook, Wikipedia API,
+      Numbeo, Census (US cities)
+- [ ] Claude API synthesizes raw data into Winston Analysis panel
+- [ ] View mode toggles: Globe / Terrain / City / Street
+- [ ] Winston orb shrinks to top-right mini during fly-to
+
+### Phase 4: RECON — "Light It Up" (Threat Overlay)
+Voice: "Light it up" → crime heatmap overlay on current location.
+
+- [ ] Crime heatmap layer using geocoded incident data
+- [ ] US cities: open data portals (Detroit, Chicago, LA, NYC, Philly
+      all publish free geocoded crime APIs, updated daily/weekly)
+- [ ] International: UNODC stats, Numbeo safety indexes
+- [ ] Side panels flip to: crime stats, gang intel, police data,
+      5-year trend charts
+- [ ] Layer toggles: Crime / Gangs / Police / Vacant Properties
+- [ ] Claude API generates threat analysis summary
+- [ ] Color-coded heatmap: green(low) → yellow → orange → red(high)
+
+### Phase 5: RECON — Advanced Voice Commands
+Natural Jarvis-style voice interaction within RECON.
+
+- [ ] "Zoom into zone 8" → camera zoom to specific area
+- [ ] "What's the situation?" → full threat brief via Claude
+- [ ] "Give me the rundown" → intel summary of current location
+- [ ] "Compare to Chicago" → side-by-side or overlay comparison
+- [ ] "Show gang territories" → colored territory overlay
+- [ ] "Show police precincts" → precinct boundary overlay
+- [ ] "Show vacant properties" → vacancy heatmap (US cities)
+- [ ] "Back to globe" / "Exit recon" → return to spinning globe or
+      Command tab
+
+### Data Source Summary (all free or free-tier)
+| Source             | Data                    | Cost    |
+|--------------------|-------------------------|---------|
+| CesiumJS           | 3D globe rendering      | Free    |
+| Cesium Ion          | World terrain tiles     | Free tier (50k/mo) |
+| CartoDB Dark Matter | Dark map tiles          | Free, no key |
+| Nominatim (OSM)    | Geocoding               | Free    |
+| World Bank API     | Demographics, economy   | Free    |
+| CIA Factbook       | Political, military     | Free    |
+| Numbeo             | Safety, cost of living  | Free    |
+| US Census          | US demographics         | Free    |
+| City Open Data     | Crime incidents (geo)   | Free    |
+| FBI UCR            | Crime statistics        | Free    |
+| Claude API         | Analysis synthesis      | ~$0.01-0.05/query |
+
+
+## Stage 5.96: Dashboard refactor (after RECON/Command shipped)
+
+`gui/main.py` has grown to ~2000 lines. Split it along natural seams
+once the tab system + RECON are stable and working.
+
+- [ ] Rename `gui/main.py` → `gui/dashboard.py` (it's the dashboard, not
+      a generic "main")
+- [ ] Extract all `*View` classes to `gui/views/` package:
+  - [ ] `gui/views/cpu.py` — CpuGraphView, CoresView
+  - [ ] `gui/views/memory.py` — MemoryView
+  - [ ] `gui/views/system.py` — SystemView
+  - [ ] `gui/views/disk.py` — DiskView
+  - [ ] `gui/views/temps.py` — TempsView
+  - [ ] `gui/views/gpu.py` — GpuView
+  - [ ] `gui/views/network.py` — NetworkView
+  - [ ] `gui/views/processes.py` — ProcessesView
+  - [ ] `gui/views/commentary.py` — CommentaryView, BrainView
+- [ ] Extract shared widgets to `gui/widgets.py` — PanelFrame, HeatBar,
+      StatusBarLabel, AskInput
+- [ ] `gui/dashboard.py` keeps only WinstonGui (tab switching, frame loop,
+      key handling) + the `run()` entry point
+- [ ] `gui/command.py` stays as-is (already separate)
+- [ ] `gui/recon.py` will be its own file when built
+- [ ] Verify all imports resolve after the split
+- [ ] Run the full dashboard + orb to confirm nothing broke
+
+
 ## Stage 6: Local LLM tuning
 - [ ] Compare 7B vs 3B speed/quality tradeoff with our current prompts
 - [ ] Optimize prompts for the 3B (it's doing 90% of the work now —
@@ -334,7 +468,7 @@ calls the same code path.
 - [ ] Eventually: web UI mode for live graph alongside TUI
 
 
-## Stage 10: PyQt6 desktop app — the big rewrite
+## Stage 10: PyQt6 desktop app — the big rewrite ✅
 The terminal is the bottleneck. When a game runs hot, Windows starves
 the terminal of redraws, ASCII can only encode so much, and there's no
 real scroll. The interim throttle (`GPU_BUSY_*` in `config.py`) makes

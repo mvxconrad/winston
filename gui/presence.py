@@ -35,14 +35,17 @@ from PyQt6.QtCore import (
     Qt, QTimer, QObject, QPoint, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QBrush, QColor, QIcon, QKeyEvent, QMouseEvent, QPainter, QPixmap,
+    QBrush, QColor, QIcon, QKeyEvent, QMouseEvent, QPainter, QPaintEvent,
+    QPixmap,
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QMenu, QPushButton, QSystemTrayIcon,
     QVBoxLayout, QWidget,
 )
 
-from .orb import Orb
+from .orb import Orb  # legacy — kept for reference
+from .winston_state import WinstonState
+from .command import WinstonCore
 
 
 # ──────────────── Voice ↔ UI bridge (thread marshaling) ────────────────
@@ -74,8 +77,12 @@ class _PresenceBridge(QObject):
 
 
 # ──────────────── The window ────────────────
-class PresenceWindow(QMainWindow):
+class PresenceWindow(QWidget):
     """Floating Winston orb. Frameless, transparent, always-on-top.
+
+    Uses QWidget (not QMainWindow) because QMainWindow has internal
+    frame painting that leaks a grey rectangle on Windows even with
+    WA_TranslucentBackground. QWidget is clean.
 
     Just the circle — no caption, no chrome by default. The orb shows
     its own state via color + amplitude pulse, and the WINSTON name is
@@ -106,6 +113,11 @@ class PresenceWindow(QMainWindow):
         self.engine = voice_engine
         self.face = face
 
+        # Unified state — single source of truth for all UIs.
+        self.winston_state = WinstonState(self)
+        self.winston_state.set_amplitude_source(
+            lambda: self.engine.amplitude())
+
         # Frameless + always-on-top + translucent so only the orb is
         # visible. WA_TranslucentBackground lets the rounded orb edges
         # blend with whatever's behind the window.
@@ -122,7 +134,21 @@ class PresenceWindow(QMainWindow):
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
         )
+        # Per-pixel alpha compositing — DWM sees only what we paint.
+        # Unpainted pixels are fully transparent AND click-through (Qt
+        # docs: "Pixels that are not painted at all will also not
+        # receive any mouse input"). No setMask() needed.
+        #
+        # IMPORTANT: do NOT add BypassWindowManagerHint here. On native
+        # Windows it bypasses DWM composition, which is the very thing
+        # that provides per-pixel alpha. Without DWM, the window gets
+        # a solid grey background — the exact bug we're fixing.
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.setAutoFillBackground(False)
+        # Transparent stylesheet prevents Qt's style engine from painting
+        # any default window background (some Windows themes do this).
+        self.setStyleSheet("background: transparent;")
         self.setWindowTitle("Winston")
         self.resize(280, 280)
         # Track mouse so enterEvent / leaveEvent fire even when the
@@ -130,27 +156,27 @@ class PresenceWindow(QMainWindow):
         # on some Wayland compositors.
         self.setMouseTracking(True)
 
-        # ── Central widget = the orb ──
-        # The orb fills the window. We make the orb mouse-transparent so
-        # all mouse events (drag, double-click) reach PresenceWindow's
-        # handlers — otherwise the orb's QWidget would swallow them.
-        central = QWidget()
-        central.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        central.setMouseTracking(True)
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+        # ── Layout = the orb fills the window directly ──
+        # No central widget / QMainWindow frame — just a flat layout on
+        # this QWidget. The orb is mouse-transparent so all mouse events
+        # (drag, double-click) reach PresenceWindow's handlers.
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self._orb = Orb(
-            get_state=lambda: self.engine.state,
-            get_amplitude=lambda: self.engine.amplitude(),
-        )
+        self._orb = WinstonCore(
+            winston_state=self.winston_state, show_label=False)
+        self._orb.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._orb.setAutoFillBackground(False)
+        self._orb.setStyleSheet("background: transparent;")
         # Make the orb invisible to the mouse so clicks fall through
         # to the window. We still SEE it; the hit-testing layer is
         # transparent.
         self._orb.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         layout.addWidget(self._orb)
+
+        # WinstonCore self-animates via its own internal QTimer at
+        # WINSTON_FPS from config — no external tick needed.
 
         # ── Hover controls (close + minimize) ──
         # Two tiny round buttons in the top-right corner. Hidden by
@@ -201,8 +227,11 @@ class PresenceWindow(QMainWindow):
         self._bridge.done.connect(self.face.on_llm_done)
         self._bridge.llm_error.connect(self.face.on_llm_error)
 
-        # Hook voice engine callbacks → bridge signals.
-        self.engine.on_state_change = self._bridge.state_changed.emit
+        # Hook voice engine callbacks → bridge signals AND unified state.
+        def _on_engine_state(state: str):
+            self._bridge.state_changed.emit(state)
+            self.winston_state.set_state(state)
+        self.engine.on_state_change = _on_engine_state
         # No caption to update — voice engine.on_user_text / on_winston_text
         # are intentionally unwired in this UI. (Brain still records
         # them via memory.json + history; we just don't show them.)
@@ -253,13 +282,68 @@ class PresenceWindow(QMainWindow):
         self._reposition_controls()
 
     def _reposition_controls(self):
-        # Top-right corner, with a small inset margin.
-        inset = 8
-        spacing = 6
-        x = self.width() - self._close_btn.width() - inset
-        y = inset
-        self._close_btn.move(x, y)
-        self._min_btn.move(x - self._min_btn.width() - spacing, y)
+        # Position buttons in the upper-right area of the disc.
+        # The disc center is (w/2, h/2), radius ~ min(w,h)*0.46.
+        # Place at roughly 1 o'clock position, near the disc edge
+        # but inside the painted area so they're fully visible.
+        w, h = self.width(), self.height()
+        cx, cy = w // 2, h // 2
+        # Further up and slightly outward — near the 1 o'clock rim.
+        bx = cx + int(w * 0.14)
+        by = cy - int(h * 0.36)
+        self._close_btn.move(bx + 26, by)
+        self._min_btn.move(bx, by)
+
+    # ──────────────── Transparent painting ────────────────
+    def paintEvent(self, event: QPaintEvent):
+        """Override to guarantee the window backing store is transparent.
+
+        On Windows, even with WA_TranslucentBackground the default
+        QWidget style may fill the window background with the palette's
+        Window color (light grey). We override to paint nothing — child
+        widgets (WinstonCore) handle all rendering on the transparent
+        backing store.
+        """
+        # Intentionally empty — do NOT call super().paintEvent().
+        # QWidget's default paintEvent is empty too, but some Windows
+        # themes inject a background fill via the style. Overriding
+        # prevents any style from painting here.
+        pass
+
+    def showEvent(self, event):
+        """After the window gets a native handle, tell Windows DWM to
+        extend the glass frame over the entire client area. This is the
+        same technique used by Chrome, Electron, and Qt's own Shaped
+        Clock example to get true per-pixel transparency on Windows.
+        """
+        super().showEvent(event)
+        self._apply_dwm_transparency()
+
+    def _apply_dwm_transparency(self):
+        """Use the Windows DWM API to extend the glass frame into the
+        entire client area, enabling true per-pixel alpha compositing.
+
+        Falls back silently on non-Windows or if the API isn't available.
+        """
+        try:
+            import ctypes
+            from ctypes import Structure, c_int, byref, windll
+
+            class MARGINS(Structure):
+                _fields_ = [
+                    ("cxLeftWidth", c_int),
+                    ("cxRightWidth", c_int),
+                    ("cyTopHeight", c_int),
+                    ("cyBottomHeight", c_int),
+                ]
+
+            # -1 = extend glass to the entire client area
+            margins = MARGINS(-1, -1, -1, -1)
+            hwnd = int(self.winId())
+            windll.dwmapi.DwmExtendFrameIntoClientArea(
+                hwnd, byref(margins))
+        except Exception:
+            pass  # Not on Windows, or DWM unavailable — no-op
 
     def enterEvent(self, event):
         self._close_btn.show()
@@ -382,10 +466,17 @@ class PresenceWindow(QMainWindow):
         """Watchdog trigger fired — show the orb. Cancel any pending
         linger-hide so the window stays up for the full speech.
 
+        If the dashboard is open, skip — the dashboard has its own
+        Winston core and the floating orb would just overlap it.
+
         If the orb is already visible (user summoned it from tray),
         leave _user_summoned True so the orb won't auto-hide after
         the triggered speech finishes.
         """
+        # Dashboard is open — triggers route there, not here.
+        if (hasattr(self, '_dashboard') and self._dashboard is not None
+                and self._dashboard.isVisible()):
+            return
         if not self.isVisible():
             self._user_summoned = False
         self._linger_timer.stop()
@@ -439,9 +530,18 @@ class PresenceWindow(QMainWindow):
             hub = getattr(self, '_hub', None)
             # Build the dashboard using the same sections the hub polls.
             sections = hub.sections if hub else []
-            dash = WinstonGui(sections, logger=None, satellite=True, hub=hub)
+            dash = WinstonGui(sections, logger=None, satellite=True, hub=hub,
+                             winston_state=self.winston_state,
+                             voice_engine=self.engine)
             dash.show()
             self._dashboard = dash
+
+            # Hide the floating orb while dashboard is open —
+            # the dashboard has its own Winston core visualization.
+            self.hide()
+
+            # When dashboard closes, restore the orb.
+            dash._on_close_callback = self._on_dashboard_closed
 
             # Tell the hub to start polling dashboard-only panels
             # (CpuGraphPanel, DiskPanel) now that someone's looking.
@@ -449,6 +549,14 @@ class PresenceWindow(QMainWindow):
                 hub.activate_all()
         except Exception as e:
             print(f"[presence] failed to open dashboard: {e!r}", flush=True)
+
+    def _on_dashboard_closed(self):
+        """Restore the floating orb when the dashboard window is closed."""
+        self._dashboard = None
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        # WinstonCore restarts its own timer automatically when shown.
 
     # ──────────────── Keys ────────────────
     def keyPressEvent(self, event: QKeyEvent):

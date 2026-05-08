@@ -32,7 +32,8 @@ from PyQt6.QtCore import Qt, QTimer, QObject, pyqtSignal
 from PyQt6.QtGui import QFont, QShortcut, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QProgressBar, QSizePolicy, QVBoxLayout, QWidget,
+    QMainWindow, QProgressBar, QPushButton, QSizePolicy, QStackedWidget,
+    QVBoxLayout, QWidget,
 )
 
 from theme import heat_pct, heat_temp
@@ -1456,11 +1457,22 @@ class WinstonGui(QMainWindow):
     """
 
     def __init__(self, sections, logger, llm_config=None, memory=None,
-                 satellite=False, hub=None):
+                 satellite=False, hub=None, winston_state=None,
+                 voice_engine=None):
         super().__init__()
         self._satellite = satellite
         self._hub = hub
+        self._winston_state = winston_state
+        self._voice_engine = voice_engine
+        self._talk_held = False
         self.setWindowTitle("Winston" + (" — Dashboard" if satellite else ""))
+
+        # Install an application-level event filter so spacebar push-to-talk
+        # works regardless of which child widget has focus. Without this,
+        # child widgets (progress bars, labels, frames) eat key events before
+        # they reach WinstonGui.keyPressEvent.
+        if voice_engine is not None:
+            QApplication.instance().installEventFilter(self)
         self.resize(1500, 950)
         self.setStyleSheet(f"QMainWindow, QWidget {{ background: {BG}; color: {BRIGHT}; }}")
 
@@ -1485,42 +1497,81 @@ class WinstonGui(QMainWindow):
         self._status = StatusBarLabel()
         root.addWidget(self._status)
 
-        # ── Row sizing strategy ──
-        # Minimum heights keep panels readable at smaller sizes.
-        # Stretch factors let rows expand proportionally at fullscreen
-        # so the dashboard fills the screen instead of leaving dead space.
-        # The CPU graph and process table benefit most from extra height.
+        # ── Tab bar ──
+        tab_bar = QHBoxLayout()
+        tab_bar.setSpacing(0)
+        self._tab_buttons = []
+        self._tab_names = ["HARDWARE", "COMMAND"]
+        for i, name in enumerate(self._tab_names):
+            btn = QPushButton(name)
+            btn.setFont(_mono(9))
+            btn.setFixedHeight(28)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda checked, idx=i: self._switch_tab(idx))
+            tab_bar.addWidget(btn)
+            self._tab_buttons.append(btn)
+        tab_bar.addStretch(1)
+        tab_bar_container = QWidget()
+        tab_bar_container.setLayout(tab_bar)
+        root.addWidget(tab_bar_container)
 
-        # CPU LOAD — full-width
+        # ── Stacked widget for tab content ──
+        self._stack = QStackedWidget()
+        root.addWidget(self._stack, stretch=1)
+
+        # ── HARDWARE tab (existing layout, wrapped in a container) ──
+        hw_tab = QWidget()
+        hw_layout = QVBoxLayout(hw_tab)
+        hw_layout.setContentsMargins(0, 0, 0, 0)
+        hw_layout.setSpacing(4)
+
+        # ── Top section: two columns ──
+        # Left:  CPU LOAD (top) + CORES | MEMORY (bottom)
+        # Right: WINSTON — one tall panel spanning both rows
+        top_section = QHBoxLayout()
+        top_section.setSpacing(4)
+
+        # Left column
+        left_col = QVBoxLayout()
+        left_col.setSpacing(4)
+
         self._cpu_graph = CpuGraphView(by_cls["CpuGraphPanel"])
         cpu_frame = PanelFrame("CPU LOAD")
         cpu_frame.body().addWidget(self._cpu_graph)
-        cpu_frame.setMinimumHeight(150)
-        root.addWidget(cpu_frame, stretch=3)
+        left_col.addWidget(cpu_frame, stretch=3)
 
-        # ── Row 1: CORES (2fr) | MEMORY (1fr) | SYSTEM (1fr) ──
-        row1 = QHBoxLayout()
-        row1.setSpacing(4)
-
+        row1_inner = QHBoxLayout()
+        row1_inner.setSpacing(4)
         self._cores = CoresView(by_cls["CpuPanel"])
         cores_frame = PanelFrame("CORES")
         cores_frame.body().addWidget(self._cores)
-        row1.addWidget(cores_frame, stretch=2)
+        row1_inner.addWidget(cores_frame, stretch=2)
 
         self._memory = MemoryView(by_cls["RamPanel"])
         mem_frame = PanelFrame("MEMORY")
         mem_frame.body().addWidget(self._memory)
-        row1.addWidget(mem_frame, stretch=1)
-
-        self._system = SystemView(by_cls["SystemPanel"])
-        sys_frame = PanelFrame("SYSTEM")
-        sys_frame.body().addWidget(self._system)
-        row1.addWidget(sys_frame, stretch=1)
+        row1_inner.addWidget(mem_frame, stretch=1)
 
         row1_container = QWidget()
-        row1_container.setLayout(row1)
-        row1_container.setMinimumHeight(110)
-        root.addWidget(row1_container, stretch=1)
+        row1_container.setLayout(row1_inner)
+        left_col.addWidget(row1_container, stretch=1)
+
+        left_widget = QWidget()
+        left_widget.setLayout(left_col)
+        top_section.addWidget(left_widget, stretch=3)
+
+        # Right column — Winston HUD spanning full height
+        from gui.command import WinstonCore
+        self._hw_core = WinstonCore(
+            winston_state=winston_state, show_label=False)
+        core_frame = PanelFrame("WINSTON")
+        core_frame.body().addWidget(self._hw_core)
+        top_section.addWidget(core_frame, stretch=1)
+
+        top_container = QWidget()
+        top_container.setLayout(top_section)
+        top_container.setMinimumHeight(260)
+        hw_layout.addWidget(top_container, stretch=4)
 
         # ── Row 2: DISK (1fr) | TEMPS (2fr) | GPU (2fr) ──
         row2 = QHBoxLayout()
@@ -1544,9 +1595,9 @@ class WinstonGui(QMainWindow):
         row2_container = QWidget()
         row2_container.setLayout(row2)
         row2_container.setMinimumHeight(140)
-        root.addWidget(row2_container, stretch=2)
+        hw_layout.addWidget(row2_container, stretch=2)
 
-        # ── Row 3: NETWORK (1fr) | PROCESSES (2fr) ──
+        # ── Row 3: NETWORK (1fr) | SYSTEM (1fr) | PROCESSES (2fr) ──
         row3 = QHBoxLayout()
         row3.setSpacing(4)
 
@@ -1554,6 +1605,12 @@ class WinstonGui(QMainWindow):
         net_frame = PanelFrame("NETWORK")
         net_frame.body().addWidget(self._network)
         row3.addWidget(net_frame, stretch=1)
+
+        # SYSTEM moved here from row 1 — frees space for bigger Winston
+        self._system = SystemView(by_cls["SystemPanel"])
+        sys_frame = PanelFrame("SYSTEM")
+        sys_frame.body().addWidget(self._system)
+        row3.addWidget(sys_frame, stretch=1)
 
         self._processes = ProcessesView(by_cls["ProcessesPanel"])
         proc_frame = PanelFrame("PROCESSES")
@@ -1563,9 +1620,26 @@ class WinstonGui(QMainWindow):
         row3_container = QWidget()
         row3_container.setLayout(row3)
         row3_container.setMinimumHeight(180)
-        root.addWidget(row3_container, stretch=3)
+        hw_layout.addWidget(row3_container, stretch=3)
+
+        self._stack.addWidget(hw_tab)  # index 0 = HARDWARE
+
+        # ── COMMAND tab ──
+        from gui.command import CommandTab
+        # Pass trigger config so the command tab can create its own runner
+        # for live trigger status display (works in both standalone + satellite).
+        trigger_cfg = self.llm_config.get("triggers", {})
+        self._command_tab = CommandTab(
+            by_cls, trigger_config=trigger_cfg,
+            winston_state=winston_state)
+        self._stack.addWidget(self._command_tab)  # index 1 = COMMAND
+
+        # Set initial tab
+        self._current_tab = 0
+        self._switch_tab(0)
 
         # ── COMMENTARY + BRAIN + ASK — only in standalone mode ──
+        # These live BELOW the tab stack so they're visible on all tabs.
         # In satellite mode (opened from the orb), the orb owns the LLM.
         # The dashboard is panels-only — more vertical space for data.
         self._commentary = None
@@ -1583,7 +1657,7 @@ class WinstonGui(QMainWindow):
             commentary_frame = PanelFrame("COMMENTARY")
             commentary_frame.body().addWidget(self._commentary)
             commentary_frame.setMinimumHeight(140)
-            root.addWidget(commentary_frame, stretch=1)
+            root.addWidget(commentary_frame, stretch=0)
 
             if self.llm_config.get("enabled") and self.llm_config.get("show_brain_panel", True):
                 from panels.brain import BrainPanel
@@ -1631,6 +1705,8 @@ class WinstonGui(QMainWindow):
                 f" <span style='color:{DIM};'>reset</span> · "
                 f"<span style='color:{BRIGHT}; font-weight:bold;'>/</span>"
                 f" <span style='color:{DIM};'>ask</span> · "
+                f"<span style='color:{BRIGHT}; font-weight:bold;'>Tab</span>"
+                f" <span style='color:{DIM};'>switch</span> · "
                 f"<span style='color:{BRIGHT}; font-weight:bold;'>F11</span>"
                 f" <span style='color:{DIM};'>fullscreen</span> · "
                 f"<span style='color:{BRIGHT}; font-weight:bold;'>Ctrl+↑/↓/←/→</span>"
@@ -1706,6 +1782,41 @@ class WinstonGui(QMainWindow):
                 and self.llm_config.get("startup_greeting", True)):
             QTimer.singleShot(300, self._commentary.start_startup_ritual)
 
+    def _switch_tab(self, index):
+        """Switch the active tab and update button styles.
+
+        The master frame loop runs at FRAME_HZ for data refresh on both
+        tabs. Winston HUD animation is independent (WINSTON_FPS via its
+        own QTimer inside WinstonCore).
+        """
+        self._current_tab = index
+        self._stack.setCurrentIndex(index)
+
+        for i, btn in enumerate(self._tab_buttons):
+            if i == index:
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: {BRIGHT};
+                        color: {BG};
+                        border: none;
+                        padding: 4px 16px;
+                        font-weight: bold;
+                    }}
+                """)
+            else:
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: transparent;
+                        color: {DIM};
+                        border: 1px solid {BORDER};
+                        padding: 4px 16px;
+                    }}
+                    QPushButton:hover {{
+                        color: {BRIGHT};
+                        border-color: {BRIGHT};
+                    }}
+                """)
+
     def _update_gpu_busy_state(self, now):
         """Return True if we should skip most frames this tick."""
         import config as _cfg
@@ -1753,6 +1864,13 @@ class WinstonGui(QMainWindow):
                 return
             self._busy_skip_counter = 0
 
+        # ── Tab-aware refresh ──
+        # Only the active tab's views get refreshed. Panel.update()
+        # (data polling) always runs in standalone mode since both tabs
+        # read from the same panel data. But view.refresh() (Qt widget
+        # repaints — the expensive part) is skipped for the hidden tab.
+        on_hardware = (self._current_tab == 0)
+
         for panel in self.sections:
             if id(panel) not in self._panel_view:
                 continue
@@ -1760,28 +1878,39 @@ class WinstonGui(QMainWindow):
                 continue
             self._panel_due_at[id(panel)] = now + self._panel_intervals[id(panel)]
             if self._hub is None:
-                # No hub — standalone mode without SensorHub, poll here.
+                # No hub — standalone mode, poll here. Always poll
+                # regardless of tab so both tabs see fresh data.
                 try:
                     panel.update()
                 except Exception:
                     continue
-            try:
-                self._panel_view[id(panel)].refresh()
-            except Exception:
-                pass
+            # Only refresh hardware views when HARDWARE tab is active.
+            if on_hardware:
+                try:
+                    self._panel_view[id(panel)].refresh()
+                except Exception:
+                    pass
 
-        # Per-frame interpolation — runs every frame (not gated by panel
-        # rate) so bars and the heatmap animate smoothly between updates.
-        # Re-collect bars every 2s in case DiskView/TempsView grew new ones.
-        if self._all_heat_bars is None or self._bar_rescan_at <= now:
-            self._all_heat_bars = []
-            for view in self._heat_bar_sources:
-                self._all_heat_bars.extend(view.findChildren(HeatBar))
-            self._bar_rescan_at = now + 2.0
-        for bar in self._all_heat_bars:
-            bar.lerp_tick()
-        if hasattr(self._cores_view, '_lerp_tick'):
-            self._cores_view._lerp_tick()
+        # Per-frame interpolation — only when HARDWARE tab is active.
+        # HeatBar lerps and CoresView heatmap are invisible on Command tab.
+        if on_hardware:
+            if self._all_heat_bars is None or self._bar_rescan_at <= now:
+                self._all_heat_bars = []
+                for view in self._heat_bar_sources:
+                    self._all_heat_bars.extend(view.findChildren(HeatBar))
+                self._bar_rescan_at = now + 2.0
+            for bar in self._all_heat_bars:
+                bar.lerp_tick()
+            if hasattr(self._cores_view, '_lerp_tick'):
+                self._cores_view._lerp_tick()
+            # Mini Winston core self-animates via its own QTimer.
+
+        # Command tab: tick animations + refresh vitals/triggers.
+        # Only when COMMAND tab is active.
+        if (not on_hardware
+                and hasattr(self, '_command_tab')
+                and self._command_tab is not None):
+            self._command_tab.frame_tick()
 
         if now >= self._status_due_at:
             self._status_due_at = now + 1.0
@@ -1806,6 +1935,39 @@ class WinstonGui(QMainWindow):
             except Exception:
                 pass
 
+    def eventFilter(self, obj, event):
+        """App-level filter: intercept spacebar for push-to-talk.
+
+        Installed on QApplication so it fires regardless of which child
+        widget has focus. Only handles Space press/release; everything
+        else passes through untouched.
+        """
+        from PyQt6.QtCore import QEvent
+        if self._voice_engine is None:
+            return False
+        # Only handle events when this window is active
+        if not self.isActiveWindow():
+            return False
+        # Don't steal space from the ASK input
+        if self._ask is not None and self._ask.hasFocus():
+            return False
+
+        if event.type() == QEvent.Type.KeyPress:
+            if (event.key() == Qt.Key.Key_Space
+                    and not event.isAutoRepeat()
+                    and not self._talk_held):
+                self._talk_held = True
+                self._voice_engine.start_listening()
+                return True  # consumed
+        elif event.type() == QEvent.Type.KeyRelease:
+            if (event.key() == Qt.Key.Key_Space
+                    and not event.isAutoRepeat()
+                    and self._talk_held):
+                self._talk_held = False
+                self._voice_engine.stop_listening()
+                return True  # consumed
+        return False  # let everything else through
+
     def keyPressEvent(self, event):
         # Global quit shortcut — handle BEFORE the ASK-focus early-return
         # so Ctrl+Q works even while the user is typing in the input.
@@ -1826,6 +1988,11 @@ class WinstonGui(QMainWindow):
 
         if event.text() == "/" and self._ask is not None:
             self._ask.setFocus()
+            return
+        if key == Qt.Key.Key_Tab:
+            # Cycle through tabs
+            next_tab = (self._current_tab + 1) % len(self._tab_names)
+            self._switch_tab(next_tab)
             return
         if key == Qt.Key.Key_F11:
             if self.isFullScreen():
@@ -1875,6 +2042,11 @@ class WinstonGui(QMainWindow):
         super().keyPressEvent(event)
 
     def closeEvent(self, event):
+        # Remove the app-level event filter so it doesn't fire after close
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
+
         if self._satellite:
             # Satellite mode: just close the window. Don't stop the
             # logger (the hub owns it), don't quit the app (the orb
@@ -1883,6 +2055,10 @@ class WinstonGui(QMainWindow):
             if hasattr(self, '_hub') and self._hub is not None:
                 self._hub.deactivate_extras()
             self._timer.stop()
+            # Notify the orb to reappear.
+            cb = getattr(self, '_on_close_callback', None)
+            if cb is not None:
+                cb()
             super().closeEvent(event)
             return
         if self.logger is not None:
