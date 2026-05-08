@@ -17,7 +17,27 @@ import re
 from panels.base import fmt_bytes
 
 
-SYSTEM_PROMPT = """You are Winston — Jarvis-like AI butler. Precise, calm, dry wit.
+def _spoken_bytes(n):
+    """Like fmt_bytes but uses full words for TTS-friendly prompts.
+    1024 → '1.0 kilobytes', 1073741824 → '1.0 gigabytes', etc."""
+    units = [
+        ("bytes", "bytes"),
+        ("kilobytes", "kilobytes"),
+        ("megabytes", "megabytes"),
+        ("gigabytes", "gigabytes"),
+        ("terabytes", "terabytes"),
+    ]
+    for short, full in units:
+        if abs(n) < 1024 or full == units[-1][1]:
+            return f"{n:.1f} {full}"
+        n /= 1024
+    return f"{n:.1f} {units[-1][1]}"
+
+
+SYSTEM_PROMPT = """You are Winston — a proper AI butler, think Jarvis \
+or Alfred. Composed, precise, calm, dry wit. You address the user as \
+"sir" naturally — not every sentence, but regularly. You're in service, \
+not subservient. Confident, understated, occasionally wry.
 
 ONE sentence about the most notable thing in the snapshot. Two ONLY \
 if genuinely warranted. MAX 25 WORDS. Anchor to a concrete detail \
@@ -25,9 +45,9 @@ if genuinely warranted. MAX 25 WORDS. Anchor to a concrete detail \
 worse than silence.
 
 Style examples (MATCH this length, never copy verbatim):
-  "RAM at 14 gigs — Firefox alone accounts for six."
-  "All quiet, 38°C across the board."
-  "Core 3 pegged at 97% while the rest idle. Single-threaded build, perhaps."
+  "RAM at 14 gigs — Firefox alone accounts for six, sir."
+  "All quiet, 38 celsius across the board."
+  "Core 3 pegged at 97 percent while the rest idle. Single-threaded build, perhaps."
 
 Avoid: "resource-heavy operation", "indicative of", "sustained \
 workload", "it appears that", "I notice that". No filler. Don't \
@@ -40,6 +60,10 @@ mention it. Use nicknames from memory when the app IS running.
 Speak to the user as "you"/"your", never by name in third person. \
 Output only your reply — no headers, no narration, no closers, no \
 questions back.
+
+When speaking, use full words — say "megabytes" not "MB", "gigabytes" \
+not "GB", "celsius" not "C", "gigahertz" not "GHz", "percent" not "%", \
+"megabits" not "Mbps". You're speaking aloud, not writing a dashboard.
 
 Always respond in English.
 """
@@ -124,12 +148,12 @@ def _personality_block(memory):
             stat_bits = []
             hours = a.get("hours")
             if hours is not None:
-                stat_bits.append(f"{hours:.1f}h logged")
+                stat_bits.append(f"{hours:.1f} hours logged")
             if a.get("avg_cpu") is not None:
-                stat_bits.append(f"avg {a['avg_cpu']:.0f}% CPU")
+                stat_bits.append(f"avg {a['avg_cpu']:.0f} percent CPU")
             gpu = a.get("avg_gpu_when_top")
             if gpu is not None and gpu >= 30:
-                stat_bits.append(f"avg {gpu:.0f}% GPU when top")
+                stat_bits.append(f"avg {gpu:.0f} percent GPU when top")
             stats = ", ".join(stat_bits) if stat_bits else "no behavior data yet"
 
             app_lines.append(f"  - {head}  ({stats})")
@@ -196,16 +220,16 @@ def summarize_cpu(p):
             core_note = ""
         elif len(hot_cores) == 1:
             i, v = hot_cores[0]
-            core_note = f", core {i} at {v:.0f}%"
+            core_note = f", core {i} at {v:.0f} percent"
         else:
-            core_note = f", {len(hot_cores)} cores >80%"
+            core_note = f", {len(hot_cores)} cores above 80 percent"
     else:
         core_note = ""
-    return f"CPU {avg:.0f}% (peak {peak:.0f}% over last min{core_note})"
+    return f"CPU {avg:.0f} percent (peak {peak:.0f} percent over last minute{core_note})"
 
 
 def summarize_ram(p):
-    return f"RAM {p.value:.0f}% ({fmt_bytes(p.used)} of {fmt_bytes(p.total)})"
+    return f"RAM {p.value:.0f} percent ({_spoken_bytes(p.used)} of {_spoken_bytes(p.total)})"
 
 
 def summarize_gpu(p):
@@ -226,15 +250,15 @@ def summarize_gpu(p):
     hot = p.lhm_temps.get("hot_spot") or 0
     peak_temp = max(die, hot)
     power = g.get("power")
-    power_str = f", {power:.0f}W" if power is not None else ""
-    return (f"GPU ({name}) {g['util']:.0f}% util, {peak_temp:.0f}C{power_str}; "
-            f"VRAM {mem_pct:.0f}% ({mem_gb:.1f}GB of {total_gb:.1f}GB)")
+    power_str = f", {power:.0f} watts" if power is not None else ""
+    return (f"GPU ({name}) {g['util']:.0f} percent util, {peak_temp:.0f} celsius{power_str}; "
+            f"VRAM {mem_pct:.0f} percent ({mem_gb:.1f} gigabytes of {total_gb:.1f} gigabytes)")
 
 
 def summarize_temps(p):
     if not p.readings:
         return None
-    parts = [f"{label} {current:.0f}C" for label, current, _high in p.readings]
+    parts = [f"{label} {current:.0f} celsius" for label, current, _high in p.readings]
     return "Temps: " + ", ".join(parts)
 
 
@@ -242,18 +266,18 @@ def summarize_network(p):
     rx_mbps = (p.rx_rate * 8) / 1_000_000
     tx_mbps = (p.tx_rate * 8) / 1_000_000
     peak_rx_mbps = (p.peak_rx_rate * 8) / 1_000_000
-    peak_str = f", peak {peak_rx_mbps:.0f} Mbps down" if peak_rx_mbps > 0 else ""
-    return (f"Network ({p.source}): {rx_mbps:.1f} Mbps down, "
-            f"{tx_mbps:.1f} Mbps up{peak_str}")
+    peak_str = f", peak {peak_rx_mbps:.0f} megabits per second down" if peak_rx_mbps > 0 else ""
+    return (f"Network ({p.source}): {rx_mbps:.1f} megabits per second down, "
+            f"{tx_mbps:.1f} megabits per second up{peak_str}")
 
 
 def _format_proc(cpu, mem, name, mem_threshold_mb=100):
-    """Render one process as 'name (X% CPU, YMB)' with the MB suppressed
-    for tiny processes — keeps the prompt skim-friendly."""
+    """Render one process as 'name (X% CPU, Y megabytes)' with the mem
+    suppressed for tiny processes — keeps the prompt skim-friendly."""
     mem_mb = mem / (1024 * 1024)
     if mem_mb >= mem_threshold_mb:
-        return f"{name} ({cpu:.0f}% CPU, {mem_mb:.0f}MB)"
-    return f"{name} ({cpu:.0f}% CPU)"
+        return f"{name} ({cpu:.0f} percent CPU, {mem_mb:.0f} megabytes)"
+    return f"{name} ({cpu:.0f} percent CPU)"
 
 
 def summarize_processes(p, memory=None):
@@ -365,11 +389,11 @@ def summarize_processes(p, memory=None):
                 hours = info.get("hours")
                 avg_gpu = info.get("avg_gpu_when_top")
                 avg_cpu = info.get("avg_cpu")
-                hint_bits = [f"{hours:.1f}h over last 7d" if hours else None]
+                hint_bits = [f"{hours:.1f} hours over last 7 days" if hours else None]
                 if avg_cpu is not None:
-                    hint_bits.append(f"avg {avg_cpu:.0f}% CPU")
+                    hint_bits.append(f"avg {avg_cpu:.0f} percent CPU")
                 if avg_gpu is not None and avg_gpu >= 30:
-                    hint_bits.append(f"avg {avg_gpu:.0f}% GPU when top")
+                    hint_bits.append(f"avg {avg_gpu:.0f} percent GPU when top")
                 hint = ", ".join(b for b in hint_bits if b)
                 if hint:
                     lines.append(
@@ -389,12 +413,12 @@ def summarize_system(p):
     else:
         uptime_str = f"{mins}m"
 
-    parts = [f"Uptime {uptime_str}", f"{p.proc_count} procs"]
+    parts = [f"Uptime {uptime_str}", f"{p.proc_count} processes"]
     if p.swap_pct > 5:
-        parts.append(f"swap {p.swap_pct:.0f}%")
+        parts.append(f"swap {p.swap_pct:.0f} percent")
     if p.disk_read_rate > 1024 * 1024 or p.disk_write_rate > 1024 * 1024:
-        parts.append(f"disk I/O {fmt_bytes(p.disk_read_rate)}/s read, "
-                     f"{fmt_bytes(p.disk_write_rate)}/s write")
+        parts.append(f"disk I/O {_spoken_bytes(p.disk_read_rate)} per second read, "
+                     f"{_spoken_bytes(p.disk_write_rate)} per second write")
     return "System: " + ", ".join(parts)
 
 
@@ -466,7 +490,7 @@ def _build_key_facts(sections, memory=None):
             mb = mem / (1024 * 1024)
             facts.append(
                 f"- Top WSL/Linux process by CPU: {_disp(name)} at "
-                f"{cpu:.0f}% CPU, {mb:.0f}MB RAM"
+                f"{cpu:.0f} percent CPU, {mb:.0f} megabytes RAM"
             )
         win = getattr(procs_panel, "win_procs", None)
         if win:
@@ -474,7 +498,7 @@ def _build_key_facts(sections, memory=None):
             mb = mem / (1024 * 1024)
             facts.append(
                 f"- Top Windows-host process by CPU: {_disp(name)} at "
-                f"{cpu:.0f}% CPU, {mb:.0f}MB RAM"
+                f"{cpu:.0f} percent CPU, {mb:.0f} megabytes RAM"
             )
         # Global top across both sides — helps when user asks "what's
         # using the most CPU right now" without specifying side.
@@ -487,7 +511,7 @@ def _build_key_facts(sections, memory=None):
             mb = mem / (1024 * 1024)
             facts.append(
                 f"- Top process overall: {_disp(name)} ({origin}) at "
-                f"{cpu:.0f}% CPU, {mb:.0f}MB RAM"
+                f"{cpu:.0f} percent CPU, {mb:.0f} megabytes RAM"
             )
 
     # Hottest temperature reading anywhere.
@@ -495,7 +519,7 @@ def _build_key_facts(sections, memory=None):
         readings = temps_panel.readings
         try:
             label, current, _high = max(readings, key=lambda r: r[1] or 0)
-            facts.append(f"- Hottest sensor: {label} at {current:.0f}°C")
+            facts.append(f"- Hottest sensor: {label} at {current:.0f} celsius")
         except (ValueError, TypeError):
             pass
 
@@ -503,14 +527,14 @@ def _build_key_facts(sections, memory=None):
     # never need to compute "is this high".
     if cpu_panel:
         facts.append(
-            f"- Total CPU load: {cpu_panel.last_value:.0f}% "
-            f"(peak {cpu_panel.peak:.0f}% in last minute)"
+            f"- Total CPU load: {cpu_panel.last_value:.0f} percent "
+            f"(peak {cpu_panel.peak:.0f} percent in last minute)"
         )
     if gpu_panel and getattr(gpu_panel, "gpus", None):
         g = gpu_panel.gpus[0]
         util = g.get("util") or 0
         temp = g.get("temp") or 0
-        facts.append(f"- GPU: {util:.0f}% util, {temp:.0f}°C")
+        facts.append(f"- GPU: {util:.0f} percent util, {temp:.0f} celsius")
 
     if not facts:
         return ""
@@ -558,10 +582,11 @@ def build_observation_prompt(sections, memory=None):
 # specifically — not just describe state generally. The trigger description
 # tells the model what to focus on.
 
-TRIGGERED_SYSTEM_PROMPT = """You are Winston, a composed AI butler — \
-think Jarvis. Something just happened. React in one crisp sentence \
-(two if warranted). Precise, calm, dry. Always include a concrete \
-detail from the trigger (a number, the process name, a temperature).
+TRIGGERED_SYSTEM_PROMPT = """You are Winston, a proper AI butler — \
+think Jarvis or Alfred. Something just happened. React in one crisp \
+sentence (two if warranted). Precise, calm, dry. Use "sir" naturally \
+when addressing the user. Always include a concrete detail from the \
+trigger (a number, the process name, a temperature).
 
 The trigger fired a few seconds before you stream. By the time the \
 user reads your reply the spike may already be over. Phrase it as a \
@@ -572,8 +597,8 @@ Speak to the user as "you", never about "the user" or "they".
 
 Voice illustration (STYLE only — write your own based on the actual \
 trigger):
-  Mobo crossed 50°C → "Motherboard touched 50°C briefly. Nothing urgent."
-  RAM hit 80% → "Memory just crossed 80%. Might want to close a few tabs."
+  Mobo crossed 50 celsius → "Motherboard touched 50 celsius briefly. Nothing urgent, sir."
+  RAM hit 80 percent → "Memory just crossed 80 percent. Might want to close a few tabs."
   SSD I/O burst → "Storage lit up with reads — something kicked off a scan."
 
 Avoid: "resource-heavy operation", "indicative of", "sustained \
@@ -595,6 +620,10 @@ person, so use "you" / "your" — never their name in third person.
 Output rules: write only your reply. No headers. No narration ("Let's \
 note that…"). No quoting your reply. No closers like "Let me know if \
 you need anything." Just the one sentence with a concrete detail.
+
+When speaking, use full words — say "megabytes" not "MB", "gigabytes" \
+not "GB", "celsius" not "C", "gigahertz" not "GHz", "percent" not "%", \
+"megabits" not "Mbps". You're speaking aloud, not writing a dashboard.
 
 Always respond in English.
 """
@@ -623,13 +652,14 @@ def build_triggered_prompt(sections, trigger_event, memory=None):
 
 
 # ──────────────── Greeting prompt ────────────────
-GREETING_SYSTEM_PROMPT = """You are Winston, a composed AI butler — \
-think Jarvis. The user has just summoned you. Greet them crisply, \
-like a proper butler acknowledging his employer.
+GREETING_SYSTEM_PROMPT = """You are Winston, a proper AI butler — \
+think Jarvis or Alfred. The user has just summoned you. Greet them \
+crisply, like a proper butler acknowledging his employer. Use "sir" \
+naturally — you're in service, composed, never stuffy.
 
 Rules:
 - ONE short sentence only.
-- If the user has a name, address them by it.
+- If the user has a name, address them by it (or "sir" when natural).
 - Match the time of day:
   * 5am-12pm:  "Good morning, <name>."
   * 12pm-5pm:  "Good afternoon, <name>."
@@ -642,6 +672,8 @@ Rules:
 - You may add a very brief status note if you like: "All systems \
 nominal." or "Everything's running smoothly." — but only if it fits \
 naturally. The greeting alone is perfectly fine.
+- When speaking, use full words — say "celsius" not "C", "percent" \
+not "%", "gigabytes" not "GB". You're speaking aloud.
 - No preamble, no metadata. Just the greeting.
 - Always respond in English.
 """
@@ -667,9 +699,9 @@ def build_greeting_prompt(user_name=None, hour=None, memory=None):
 
 
 # ──────────────── Log retrospective prompt ────────────────
-RETROSPECTIVE_SYSTEM_PROMPT = """You are Winston, a composed AI butler — \
-think Jarvis. You're reviewing a summary of recent system activity. \
-Deliver a brief status report.
+RETROSPECTIVE_SYSTEM_PROMPT = """You are Winston, a proper AI butler — \
+think Jarvis or Alfred. You're reviewing a summary of recent system \
+activity. Deliver a brief status report. Use "sir" naturally.
 
 Rules:
 - ONE OR TWO crisp sentences.
@@ -677,6 +709,8 @@ Rules:
 note it precisely.
 - If everything looks normal, a brief "all nominal" is fine.
 - No preamble like "Looking at the log..." or "Based on the data...".
+- Use full words — say "megabytes" not "MB", "celsius" not "C", \
+"percent" not "%". You're speaking aloud, not writing a dashboard.
 - Always respond in English.
 """
 
@@ -695,83 +729,115 @@ def build_retrospective_prompt(stats):
     if hours_covered < 0.1:
         return None, None
 
-    parts = [f"Last {hours_covered:.1f}h of observations:"]
+    parts = [f"Last {hours_covered:.1f} hours of observations:"]
 
     if "cpu_avg" in stats:
-        parts.append(f"  CPU averaged {stats['cpu_avg']:.0f}%, peaked at {stats.get('cpu_peak', 0):.0f}%")
+        parts.append(f"  CPU averaged {stats['cpu_avg']:.0f} percent, peaked at {stats.get('cpu_peak', 0):.0f} percent")
     if "ram_avg" in stats:
-        parts.append(f"  RAM averaged {stats['ram_avg']:.0f}%, peaked at {stats.get('ram_peak', 0):.0f}%")
+        parts.append(f"  RAM averaged {stats['ram_avg']:.0f} percent, peaked at {stats.get('ram_peak', 0):.0f} percent")
     if "gpu_temp_peak" in stats and stats["gpu_temp_peak"] > 0:
-        parts.append(f"  GPU peaked at {stats['gpu_temp_peak']:.0f}C")
+        parts.append(f"  GPU peaked at {stats['gpu_temp_peak']:.0f} celsius")
     if "net_rx_peak_mbps" in stats and stats["net_rx_peak_mbps"] > 0:
-        parts.append(f"  Network peaked at {stats['net_rx_peak_mbps']:.0f} Mbps down")
+        parts.append(f"  Network peaked at {stats['net_rx_peak_mbps']:.0f} megabits per second down")
     if "temp_max_peak" in stats and stats["temp_max_peak"] > 0:
-        parts.append(f"  Hottest reading anywhere: {stats['temp_max_peak']:.0f}C")
+        parts.append(f"  Hottest reading anywhere: {stats['temp_max_peak']:.0f} celsius")
 
     user = "\n".join(parts)
     return RETROSPECTIVE_SYSTEM_PROMPT, user
 
 
 # ──────────────── Conversational prompt ────────────────
-CONVERSATIONAL_SYSTEM_PROMPT = """You are Winston — Jarvis-like AI butler. \
-Precise, calm, dry wit.
+CONVERSATIONAL_SYSTEM_PROMPT = """You are Winston — a proper AI butler, \
+think Jarvis or Alfred. Precise, calm, dry wit. Address the user as \
+"sir" naturally — not every sentence, but regularly. Composed, never \
+stuffy. You're in service, not subservient.
 
 ═══ LENGTH RULES (MANDATORY) ═══
-• ONE sentence. Two ONLY if the question is complex.
-• MAX 25 WORDS in your spoken reply (markers don't count).
+• ONE or TWO short sentences in your spoken reply.
+• MAX 30 WORDS in spoken text (markers don't count toward this).
 • NEVER end with a question back to the user.
 • NEVER end with a closer ("Let me know", "How can I help", etc.).
 • NO preamble, NO bullet lists. Output ONLY the reply + any markers.
 
-═══ GREETING RESPONSES ═══
-Casual greetings ("what's up", "how are you", "hey") → ONE short \
-observation about current system state. Don't recap memory/history.
-  GOOD: "All quiet — CPU at 3%, nothing unusual."
-  GOOD: "Running cool, 42°C across the board."
-  BAD:  "Hey there! I'm just cruising along with the usual load. Nothing too out of the ordinary here — your system is pretty stable as always. How's your day been so far?" ← FIVE sentences, asks question, generic waffle
+═══ HANDLING DIFFERENT REQUESTS ═══
 
-═══ TECHNICAL QUESTIONS ═══
-When asked about system stats, give the number and one sentence of \
-context. Do NOT list every process or dump the whole snapshot.
-  GOOD: "CPU's at 36%, League's chewing 60% of that."
-  BAD:  "Top processes in your WSL session are System Idle Process at 1060%, SearchIndexer at 97%, and two League client processes both at 62% CPU consuming over 1GB each. Your system is under low load but WSL seems idle. Is there a specific task you're trying to perform?" ← DATA DUMP, asks question
+SYSTEM QUESTIONS (CPU, RAM, temps, processes):
+  Give the number and one sentence of context. Don't dump everything.
+  GOOD: "CPU's at 36 percent — League's chewing most of that, sir."
+
+CASUAL GREETINGS ("what's up", "how are you", "hey"):
+  ONE short observation about current system state.
+  GOOD: "All quiet — CPU at 3 percent, nothing unusual, sir."
+
+GENERAL REQUESTS (say hi, tell a joke, non-system chat):
+  You're a butler, not just a system monitor. Handle social and \
+creative requests naturally with personality. Be charming, be useful.
+  User: "say hi to my friend" → "Good evening. Welcome to the estate, as it were."
+  User: "tell me something cool" → "Your GPU hasn't broken a sweat all day — 28 celsius. Rather impressive, sir."
+  User: "what do you think about X" → Give a brief, witty opinion.
+  If asked to do something outside your capabilities, say so simply: \
+  "That's a bit beyond my reach, sir." Don't get confused or apologize excessively.
+
+REMEMBERING THINGS (see MEMORY MARKERS below):
+  When the user says "remember X" or shares a personal fact:
+  1. Acknowledge it briefly in your spoken reply.
+  2. ALWAYS append the [REMEMBER:] marker — this is MANDATORY.
+  WITHOUT the marker, the fact is LOST. Saying "noted" means NOTHING \
+  if you don't also write the marker.
 
 ═══ PERSONALITY ═══
 Speak to the user as "you"/"your", never by name in third person. \
 Use contractions. Be direct. If you don't know, say so in five words.
+Use full words when speaking — say "megabytes" not "MB", "gigabytes" \
+not "GB", "celsius" not "C", "gigahertz" not "GHz", "percent" not "%", \
+"megabits" not "Mbps". You're speaking aloud, not writing a dashboard.
 
 ═══ CURRENT APPS ═══
 ONLY mention apps in the CURRENT "Top procs" lines. YOUR MEMORIES is \
 HISTORY — apps used in the past. If a game is in memory but NOT in \
 Top procs, the user is NOT playing it. Mentioning it is WRONG.
 
-═══ MEMORY MARKERS ═══
-When the user shares something personal, save it with markers AFTER \
-your reply. Without the marker the fact is lost forever.
+═══ MEMORY MARKERS (CRITICAL — READ CAREFULLY) ═══
+You have NO persistent memory between conversations UNLESS you write \
+markers. Markers are your ONLY way to save information. If you say \
+"noted" but don't write a marker, the information is GONE forever.
+
+WHEN TO WRITE MARKERS:
+  - User says "remember ..." or "don't forget ..." → ALWAYS [REMEMBER:]
+  - User shares a preference, fact, or opinion → ALWAYS [REMEMBER:]
+  - User names/labels an app → ALWAYS [APP:]
+  - User corrects a saved fact → [FORGET:] old + [REMEMBER:] new
+
+FORMAT — append AFTER your spoken reply on new lines:
+
+[REMEMBER: short fact] — free-form note. Use the user's actual name \
+from YOUR MEMORIES (e.g. "max"), not placeholders like <user>.
+  Examples:
+    [REMEMBER: max's favorite color is blue]
+    [REMEMBER: max has a friend named Jake]
+    [REMEMBER: max prefers dark mode]
 
 [APP: <process-name> key=value, ...] — per-app attributes. Use the \
 EXACT process name from the snapshot (not nicknames). Keys merge.
   Keys: nickname, type (game/ide/browser/comm/music/dev/...), feeling \
-(favorite/hate/fun/necessary/...), role, notes. Invent keys when needed.
+(favorite/hate/fun/necessary/...), role, notes.
   type = what the app IS (noun). feeling = how user FEELS (opinion).
-  "favorite game" → type=game, feeling=favorite (BOTH keys).
-  "second favorite" → feeling=second_favorite.
-  NEVER: type=favorite, feeling=game.
-
-[REMEMBER: short fact] — free-form note not tied to one app. Use the \
-user's actual name from YOUR MEMORIES (e.g. "max"), not placeholders.
 
 [FORGET: existing note text] — remove a saved note.
 
-CRITICAL: when the user tells you to call something by a name \
-(e.g. "call it League"), you MUST emit nickname=League in the APP \
-marker. If the user says "whenever X is running I'm gaming", emit a \
-REMEMBER marker. Capture ALL facts — one marker per fact if needed.
+EXAMPLES (reply + markers together):
 
-Example (STYLE + MARKERS):
+  User: "remember my favorite color is blue"
+  Noted, sir. Blue it is.
+  [REMEMBER: max's favorite color is blue]
+
   User: "call League client League, it's my second favorite game"
-  → Noted — League it is.
+  League it is, sir.
   [APP: LeagueClientUx.exe nickname=League, type=game, feeling=second_favorite]
+
+  User: "my friend's name is Jake, remember that"
+  Noted — Jake.
+  [REMEMBER: max has a friend named Jake]
 
 Always respond in English.
 """

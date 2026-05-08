@@ -531,6 +531,8 @@ class PresenceWindow(QWidget):
             # Build the dashboard using the same sections the hub polls.
             sections = hub.sections if hub else []
             dash = WinstonGui(sections, logger=None, satellite=True, hub=hub,
+                             llm_config=self.face.llm_config,
+                             memory=self.face.memory,
                              winston_state=self.winston_state,
                              voice_engine=self.engine)
             dash.show()
@@ -611,8 +613,10 @@ class PresenceFace:
     def __init__(self, voice_engine, llm_config, memory, sections,
                  watchdog: bool = False):
         self.voice = voice_engine
+        self.llm_config = llm_config or {}
+        self.memory = memory
         from brain.commentary_engine import CommentaryEngine
-        self.engine = CommentaryEngine(sections, llm_config or {}, memory)
+        self.engine = CommentaryEngine(sections, self.llm_config, memory)
         self.sections = sections
 
         # Watchdog mode: dormant by default, wake on trigger, sleep after
