@@ -16,6 +16,9 @@ log-learner can rank Windows apps even if a Linux process happened to
 be the global top at the moment of write).
 """
 import os
+import threading
+import time
+
 import psutil
 from rich.text import Text
 
@@ -102,8 +105,14 @@ def _enrich_name(pid, base_name):
 class ProcessesPanel:
     """Top-N table merging Linux psutil rows + Windows host rows.
 
+    Threading model (same pattern as GpuPanel):
+      psutil.process_iter() holds the GIL for 100-200ms on Windows — long
+      enough to stutter the Qt animation timers. A background thread does
+      the expensive iteration and stashes results in a lock-guarded cache.
+      update() on the SensorHub thread just copies the cache (sub-ms).
+
     Attributes used by views:
-      procs:     list[(cpu_pct, mem, name, pid)]   — psutil-side, every update()
+      procs:     list[(cpu_pct, mem, name, pid)]   — psutil-side, cached
       win_procs: list[(cpu_pct, mem, name, pid)]   — host-side, daemon-cached
       limit:     max rows shown by the consuming view
     """
@@ -116,34 +125,68 @@ class ProcessesPanel:
         # both this panel and brain/* read the same cache.
         self._poller = get_shared_poller()
 
-    @property
-    def title(self):
-        return "PROCESSES (host+wsl)" if self.win_procs else "PROCESSES"
+        # Background thread for psutil.process_iter — avoids GIL hold
+        # on the SensorHub thread (which would block Qt timers).
+        self._lock = threading.Lock()
+        self._cached_procs = []
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def _start_bg_thread(self):
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._poll_loop, name="winston-proc-poller", daemon=True)
+        self._thread.start()
 
     # Noise processes to hide — these either show inverted idle time
     # (System Idle Process) or are Windows kernel bookkeeping that
     # clutters the top-N list without being actionable.
     _HIDDEN = frozenset({"System Idle Process", "Idle"})
 
-    def update(self):
-        procs = []
-        for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_info']):
+    # How often the background thread re-scans. Matches the panel's
+    # configured PROCESSES_HZ (0.2 = every 5s) but decoupled so the
+    # SensorHub's update() call is always cheap.
+    _POLL_SEC = 5.0
+
+    def _poll_loop(self):
+        """Background thread: run process_iter at _POLL_SEC cadence."""
+        while not self._stop_event.is_set():
+            procs = []
             try:
-                info = p.info
-                name = info['name'] or '?'
-                if name in self._HIDDEN:
-                    continue
-                cpu = info['cpu_percent'] or 0.0
-                mem = info['memory_info'].rss if info['memory_info'] else 0
-                procs.append((cpu, mem, name, info['pid']))
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        procs.sort(key=lambda p: -p[0])
-        # self.procs holds RAW psutil names. Display-time enrichment
-        # (`python3 (winston.py) [self]`) happens in render() / GUI views
-        # via display_name() so the CSV log stays clean — otherwise the
-        # enriched string ends up as a "tracked app" in memory.json.
-        self.procs = procs[:self.limit]
+                for p in psutil.process_iter(
+                        ['pid', 'name', 'cpu_percent', 'memory_info']):
+                    try:
+                        info = p.info
+                        name = info['name'] or '?'
+                        if name in self._HIDDEN:
+                            continue
+                        cpu = info['cpu_percent'] or 0.0
+                        mem = (info['memory_info'].rss
+                               if info['memory_info'] else 0)
+                        procs.append((cpu, mem, name, info['pid']))
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+            except Exception:
+                pass
+            procs.sort(key=lambda p: -p[0])
+            with self._lock:
+                self._cached_procs = procs
+            if self._stop_event.wait(self._POLL_SEC):
+                return
+
+    @property
+    def title(self):
+        return "PROCESSES (host+wsl)" if self.win_procs else "PROCESSES"
+
+    def update(self):
+        """Copy from background cache — sub-millisecond."""
+        # Lazily start the background thread on first update.
+        if self._thread is None:
+            self._start_bg_thread()
+
+        with self._lock:
+            self.procs = self._cached_procs[:self.limit]
 
         # Pull whatever the shared poller has cached. Empty list until
         # the poller's first sample-pair completes (~5s after launch).

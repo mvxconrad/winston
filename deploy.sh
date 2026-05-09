@@ -157,7 +157,9 @@ echo "==> [4/7] Installing Python packages..."
     faster-whisper \
     piper-tts \
     elevenlabs \
-    requests
+    requests \
+    PyOpenGL \
+    PyOpenGL-accelerate
 
 echo "    Done."
 echo

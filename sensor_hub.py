@@ -158,11 +158,13 @@ class SensorHub:
                     panel.update()
                 except Exception:
                     pass
-                # Tiny GIL yield between panel updates. Without this,
-                # a full panel sweep holds the GIL for 50-150ms and
-                # PortAudio's callback thread can't grab it in time,
-                # causing audio stutter.
-                time.sleep(0.001)
+                # GIL yield between panel updates. Without this, a full
+                # panel sweep holds the GIL for 50-150ms and blocks the
+                # Qt event loop (animation stutters) and PortAudio's
+                # callback thread (audio stutter). 10ms gives the main
+                # thread time to process ~1 animation frame between
+                # each panel poll.
+                time.sleep(0.010)
 
             # Logger tick — writes CSV at LOGGER_HZ.
             if self._logger is not None and now >= self._log_due_at:

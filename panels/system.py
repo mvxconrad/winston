@@ -3,7 +3,9 @@
 Designed to fit in a 9-line panel body. All sections inline-aligned.
 """
 import os
+import threading
 import time
+
 import psutil
 from datetime import timedelta
 from rich.text import Text
@@ -30,22 +32,38 @@ class SystemPanel:
         self._last_disk_io = None
         self._last_disk_time = None
 
+        # Thread count: expensive (full process_iter). Sampled on a
+        # throwaway background thread every 30s to avoid GIL stalls.
+        self._thread_lock = threading.Lock()
+        self._thread_count_cached = 0
+        self._thread_refresh_thread = None
+        self._thread_due_at = 0.0
+
     def update(self):
         try:
             self.load_1, self.load_5, self.load_15 = os.getloadavg()
         except (OSError, AttributeError):
             self.load_1 = self.load_5 = self.load_15 = 0.0
 
-        count = 0
-        threads = 0
-        for p in psutil.process_iter(['num_threads']):
-            count += 1
-            try:
-                threads += p.info['num_threads'] or 0
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
-        self.proc_count = count
-        self.thread_count = threads
+        # psutil.pids() is a single kernel call — orders of magnitude
+        # cheaper than process_iter which opens /proc/<pid>/stat for
+        # every process. Thread count is nice-to-have but not worth
+        # a 100-200ms GIL hold every 2 seconds.
+        self.proc_count = len(psutil.pids())
+
+        # Thread count: read cached value (never blocks). Refresh the
+        # cache on a throwaway background thread every 30 seconds.
+        now = time.monotonic()
+        with self._thread_lock:
+            self.thread_count = self._thread_count_cached
+        if now >= self._thread_due_at:
+            self._thread_due_at = now + 30.0
+            if (self._thread_refresh_thread is None
+                    or not self._thread_refresh_thread.is_alive()):
+                self._thread_refresh_thread = threading.Thread(
+                    target=self._count_threads, daemon=True,
+                    name="winston-threadcount")
+                self._thread_refresh_thread.start()
 
         try:
             sw = psutil.swap_memory()
@@ -74,6 +92,21 @@ class SystemPanel:
             self.disk_write_rate = 0
 
         self.uptime_seconds = time.time() - psutil.boot_time()
+
+    def _count_threads(self):
+        """Run on a throwaway daemon thread so the GIL hold from
+        process_iter doesn't block SensorHub or Qt timers."""
+        threads = 0
+        try:
+            for p in psutil.process_iter(['num_threads']):
+                try:
+                    threads += p.info['num_threads'] or 0
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except Exception:
+            return
+        with self._thread_lock:
+            self._thread_count_cached = threads
 
     def _load_color(self, load):
         ratio = (load / self.cpu_count) * 100

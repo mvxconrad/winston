@@ -36,7 +36,7 @@ this is the file.
 # is repainted. 10 is plenty for a system monitor — data only changes every
 # 250ms-1s. Higher rates burn CPU on redundant repaints.
 FRAME_HZ       = 10.0
-WINSTON_FPS    = 60          # Winston HUD circle animation rate (all 3 UIs)
+WINSTON_FPS    = 30          # 30 is smooth for slow arcs/particles, halves paint calls
 
 # GPU-busy throttle: when a game is running the GPU spikes and the terminal
 # emulator gets starved of redraws by Windows, making Winston feel laggy.
@@ -54,9 +54,9 @@ RAM_HZ         = 1.0   # was 2 — RAM doesn't swing fast
 SYSTEM_HZ      = 0.5
 DISK_HZ        = 0.1
 TEMPS_HZ       = 0.5   # was 1 — temps move slowly
-GPU_HZ         = 1.0   # was 2
+GPU_HZ         = 0.5   # was 1 — nvidia-smi subprocess is expensive on Windows
 NETWORK_HZ     = 1.0   # was 2
-PROCESSES_HZ   = 0.5   # was 1 — process_iter is the most expensive call
+PROCESSES_HZ   = 0.2   # was 0.5 — process_iter holds GIL for 100ms+ on Windows
 PROCESSES_LIMIT = 14   # rows shown in the PROCESSES panel
 
 LOGGER_HZ      = 1.0  # fixed-rate CSV writes (clean time-series for analysis)

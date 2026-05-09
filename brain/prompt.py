@@ -810,20 +810,24 @@ WHEN TO WRITE MARKERS:
 
 FORMAT — append AFTER your spoken reply on new lines:
 
-[REMEMBER: short fact] — free-form note. Use the user's actual name \
-from YOUR MEMORIES (e.g. "max"), not placeholders like <user>.
+[REMEMBER: short fact about the user]
+  Saves a personal fact. Use the user's real name (e.g. "max"), \
+never placeholders like <user>. NEVER say the words "free form note" \
+or any format description aloud — just write the marker silently.
   Examples:
     [REMEMBER: max's favorite color is blue]
     [REMEMBER: max has a friend named Jake]
     [REMEMBER: max prefers dark mode]
 
-[APP: <process-name> key=value, ...] — per-app attributes. Use the \
-EXACT process name from the snapshot (not nicknames). Keys merge.
+[APP: <process-name> key=value, ...]
+  Saves per-app attributes. Use the EXACT process name from the \
+snapshot (not nicknames). Keys merge with existing data.
   Keys: nickname, type (game/ide/browser/comm/music/dev/...), feeling \
 (favorite/hate/fun/necessary/...), role, notes.
   type = what the app IS (noun). feeling = how user FEELS (opinion).
 
-[FORGET: existing note text] — remove a saved note.
+[FORGET: existing note text]
+  Removes a previously saved note (matched case-insensitively).
 
 EXAMPLES (reply + markers together):
 
