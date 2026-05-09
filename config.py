@@ -48,8 +48,8 @@ GPU_BUSY_PCT       = 50      # threshold (%)
 GPU_BUSY_HOLD_SEC  = 3.0     # how long above threshold before throttling
 GPU_CALM_HOLD_SEC  = 5.0     # how long below threshold before resuming
 
-CPU_GRAPH_HZ   = 2.0   # was 4 — data barely changes in 250ms
-CPU_CORES_HZ   = 2.0   # was 4
+CPU_GRAPH_HZ   = 1.0   # was 2 — heatmap updates fine at 1Hz
+CPU_CORES_HZ   = 1.0   # was 2 — per-core % doesn't swing in 500ms
 RAM_HZ         = 1.0   # was 2 — RAM doesn't swing fast
 SYSTEM_HZ      = 0.5
 DISK_HZ        = 0.1

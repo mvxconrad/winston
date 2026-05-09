@@ -1501,7 +1501,7 @@ class WinstonGui(QMainWindow):
         tab_bar = QHBoxLayout()
         tab_bar.setSpacing(0)
         self._tab_buttons = []
-        self._tab_names = ["HARDWARE", "COMMAND"]
+        self._tab_names = ["HARDWARE", "COMMAND", "RECON"]
         for i, name in enumerate(self._tab_names):
             btn = QPushButton(name)
             btn.setFont(_mono(9))
@@ -1633,6 +1633,11 @@ class WinstonGui(QMainWindow):
             by_cls, trigger_config=trigger_cfg,
             winston_state=winston_state)
         self._stack.addWidget(self._command_tab)  # index 1 = COMMAND
+
+        # ── RECON tab ──
+        from gui.recon import ReconTab
+        self._recon_tab = ReconTab(winston_state=winston_state)
+        self._stack.addWidget(self._recon_tab)  # index 2 = RECON
 
         # Set initial tab
         self._current_tab = 0
@@ -1796,11 +1801,13 @@ class WinstonGui(QMainWindow):
             if i == index:
                 btn.setStyleSheet(f"""
                     QPushButton {{
-                        background: {BRIGHT};
-                        color: {BG};
+                        background: transparent;
+                        color: {BRIGHT};
                         border: none;
-                        padding: 4px 16px;
+                        border-bottom: 2px solid {BRIGHT};
+                        padding: 4px 18px 6px 18px;
                         font-weight: bold;
+                        letter-spacing: 2px;
                     }}
                 """)
             else:
@@ -1808,12 +1815,13 @@ class WinstonGui(QMainWindow):
                     QPushButton {{
                         background: transparent;
                         color: {DIM};
-                        border: 1px solid {BORDER};
-                        padding: 4px 16px;
+                        border: none;
+                        border-bottom: 2px solid transparent;
+                        padding: 4px 18px 6px 18px;
                     }}
                     QPushButton:hover {{
                         color: {BRIGHT};
-                        border-color: {BRIGHT};
+                        border-bottom: 2px solid {BORDER};
                     }}
                 """)
 
@@ -1906,11 +1914,16 @@ class WinstonGui(QMainWindow):
             # Mini Winston core self-animates via its own QTimer.
 
         # Command tab: tick animations + refresh vitals/triggers.
-        # Only when COMMAND tab is active.
-        if (not on_hardware
+        if (self._current_tab == 1
                 and hasattr(self, '_command_tab')
                 and self._command_tab is not None):
             self._command_tab.frame_tick()
+
+        # RECON tab: tick globe + panel refresh.
+        if (self._current_tab == 2
+                and hasattr(self, '_recon_tab')
+                and self._recon_tab is not None):
+            self._recon_tab.frame_tick()
 
         if now >= self._status_due_at:
             self._status_due_at = now + 1.0

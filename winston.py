@@ -26,6 +26,7 @@ same for all. Each face's `run()` takes the same `(sections, logger,
 config=)` signature.
 """
 import faulthandler
+import gc
 import os
 import sys
 from pathlib import Path
@@ -34,6 +35,15 @@ from pathlib import Path
 # critical for diagnosing the silent-exit bug on Windows where
 # Python "exits clean" but actually died inside Qt/sounddevice.
 faulthandler.enable()
+
+# ── GC tuning ──────────────────────────────────────────────
+# Winston creates tons of short-lived objects every cycle (process
+# tuples, sensor readings, formatted strings). Default gen-0 threshold
+# (700) triggers frequent stop-the-world collections that stutter the
+# Qt animation loop. Raising gen-0 to 5000 batches more garbage into
+# fewer, slightly longer collections — the net effect is smoother
+# animation at the cost of ~2-5MB more transient memory.
+gc.set_threshold(5000, 10, 10)
 
 
 def _load_dotenv():
