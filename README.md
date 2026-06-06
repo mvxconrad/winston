@@ -2,7 +2,7 @@
 
 <p align="center">
   <b>W</b>ell-trained &nbsp;·&nbsp; <b>I</b>ntuitive &nbsp;·&nbsp; <b>N</b>eural &nbsp;·&nbsp; <b>S</b>ystem &nbsp;·&nbsp;
-  <b>T</b>ranslating &nbsp;·&nbsp; <b>O</b>bserved &nbsp;·&nbsp; <b>N</b>umbers
+  <b>T</b>hat &nbsp;·&nbsp; <b>O</b>bserves &nbsp;·&nbsp; <b>N</b>umbers
 </p>
 
 <p align="center"><i>Most system monitors show numbers. Winston watches the same numbers, learns what they mean for you, and talks about your machine like a person who knows you would.</i></p>
